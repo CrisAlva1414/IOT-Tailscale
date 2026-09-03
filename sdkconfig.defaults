@@ -14,7 +14,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 # Partición factory más holgada que el default de 1 MB: margen para el
 # stack de protocolo sin pelear por espacio en esta etapa.
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# Tabla custom: incluye nvs_keys para NVS encryption (ADR-0003).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xB000
 
 # Logs en INFO para el banco; bajar a ERROR/none recién en perfil de prod.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

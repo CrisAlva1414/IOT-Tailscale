@@ -61,10 +61,14 @@ relacionado). Pendiente: validar en hardware que el nodo se mantiene online > 1h
 **Archivos clave**: `components/tsnode/src/proto/h2.{c,h}` (h2_ping), `components/tsnode/src/proto/tsnode_client.c` (keepalive poll loop), `tests/unit/test_h2.c`
 
 ### GOAL-7: Flash encryption en Release mode
-**Estado**: DEFERRED
+**Estado**: BUILD READY (config completa, build Release exitoso, pendiente flasheo en hardware)
 **Criterio de éxito**: Build Release con flash encryption activa, probado en hardware.
-**Problema actual**: Configs creadas pero nunca flasheadas en Release.
-**Archivos clave**: `sdkconfig.prod`
+**Estado técnico**: Particion table custom `partitions.csv` creada con `nvs_keys` (8K, encrypted flag).
+Offset de partition table subido a 0xB000 (bootloader con flash encryption ocupa 0x90b0, excede el default 0x8000).
+Build Release con `sdkconfig.defaults;sdkconfig.prod` exitoso: flash encryption Release, NVS encryption
+flash-enc-based, UART ROM DL mode limitado. Todos los tests unitarios PASS. Pendiente: flashear en hardware,
+verificar eFuse FLASH_CRYPT_CNT quemado, primer boot cifra in-place (sin corte de alimentación).
+**Archivos clave**: `partitions.csv`, `sdkconfig.prod`, `sdkconfig.defaults` (offset 0xB000)
 
 ## Flujo del Loop
 
