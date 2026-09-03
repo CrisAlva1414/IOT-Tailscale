@@ -20,8 +20,6 @@ por qué mbedTLS no alcanza para ese caso puntual, antes de agregarse aquí.
 
 ## Dependencias actuales
 
-_Ninguna todavía. Esta tabla se completa a medida que se agregan._
-
 | Dependencia | Origen (repo@commit) | Razón | ADR asociado |
 |---|---|---|---|
-| — | — | — | — |
+| `salsa20poly1305/` (Salsa20/HSalsa20/XSalsa20 + Poly1305) | TweetNaCl `https://tweetnacl.cr.yp.to/` (dominio público, reference implementation de Bernstein et al.) — extraído del archivo único `tweetnacl.c`, y cross-validado byte-a-byte en `tests/unit/test_nacl_box.c` | mbedTLS de ESP-IDF **no provee** Salsa20/HSalsa20 (verificado contra el árbol de mbedTLS 3.6.3), necesarios para replicar el `crypto_box`/`secretbox` de Tailscale disco (NaCl XSalsa20-Poly1305). Se extrae de la referencia auditable en vez de reimplementar ad-hoc o vendorizar + parchear `noise-c` (como `alfs/tailscale-iot`, prohibido por AGENTS.md §6) | ADR-0015 |

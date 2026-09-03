@@ -8,7 +8,7 @@ CRYPTO = $(TSNODE)/src/crypto
 WG = $(TSNODE)/src/wg
 VECTORS = protocol_vectors
 
-TESTS = test_h2 test_blake2s test_replay test_wg
+TESTS = test_h2 test_blake2s test_replay test_wg test_nacl_box
 
 all: $(TESTS)
 
@@ -52,11 +52,25 @@ test_wg: test_wg.c $(WG)/wg.c $(WG)/wg.h $(WG)/replay.c \
 		vendor/chacha20poly1305_rfc8439.c vendor/wg_crypto_host.c \
 		$(VENDORTW)
 
+test_nacl_box: test_nacl_box.c $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
+	../../third_party/salsa20poly1305/salsa20.c \
+	../../third_party/salsa20poly1305/poly1305.c \
+	$(TSNODE)/include/tsnode_err.h $(VENDORTW) vendor/tweetnacl.h
+	$(CC) $(CFLAGS) -DPOLY1305_32BIT=1 \
+		-I$(TSNODE)/src/crypto -I../../third_party/salsa20poly1305 \
+		-I$(TSNODE)/include -Ivendor \
+		-o $@ test_nacl_box.c \
+		$(CRYPTO)/nacl_box.c \
+		../../third_party/salsa20poly1305/salsa20.c \
+		../../third_party/salsa20poly1305/poly1305.c \
+		$(VENDORTW)
+
 check: all
 	./test_h2
 	./test_blake2s
 	./test_replay
 	./test_wg
+	./test_nacl_box
 
 clean:
 	rm -f $(TESTS)

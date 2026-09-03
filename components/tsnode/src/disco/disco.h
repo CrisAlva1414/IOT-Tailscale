@@ -5,7 +5,8 @@
  * Explicitly OUT of scope: DERP relay, CallMeMaybe via DERP, IPv6.
  *
  * Pure C11, no platform headers (ADR-0006). All I/O via port layer.
- * Crypto via mbedTLS (ChaCha20-Poly1305, X25519).
+ * Crypto via NaCl crypto_box (XSalsa20-Poly1305, ADR-0015), with X25519
+ * injected from the WireGuard crypto backend.
  */
 
 #ifndef TSNODE_DISCO_H
@@ -33,7 +34,7 @@ extern "C" {
 #define TSNODE_DISCO_NONCE_LEN     24u
 #define TSNODE_DISCO_TXID_LEN      12u
 #define TSNODE_DISCO_PING_MIN_LEN  44u   /* type(1)+ver(1)+txid(12)+nodekey(32) */
-#define TSNODE_DISCO_PONG_LEN      30u   /* type(1)+ver(1)+txid(12)+ip(16)+port(2) */
+#define TSNODE_DISCO_PONG_LEN      32u   /* type(1)+ver(1)+txid(12)+ip16(16)+port(2) */
 #define TSNODE_DISCO_MACBYTES      16u   /* Poly1305 tag */
 #define TSNODE_DISCO_MAX_PKT       256u
 
@@ -191,6 +192,15 @@ tsnode_err_t tsnode_disco_poll(tsnode_disco_state_t *st,
  */
 bool tsnode_disco_get_peer_endpoint(const tsnode_disco_state_t *st,
                                     int peer_idx,
+                                    uint32_t *ip_out, uint16_t *port_out);
+
+/*
+ * Get the STUN-discovered public endpoint for this node.
+ * Returns true (and fills ip/port) if STUN discovery has succeeded.
+ * Used by the MapRequest builder to report the endpoint reachable from
+ * the internet instead of the local WiFi IP (GOAL-3).
+ */
+bool tsnode_disco_get_stun_endpoint(const tsnode_disco_state_t *st,
                                     uint32_t *ip_out, uint16_t *port_out);
 
 #ifdef __cplusplus

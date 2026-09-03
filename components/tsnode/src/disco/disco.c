@@ -2,7 +2,8 @@
  * Disco protocol: minimal implementation for NAT traversal (ADR-0014).
  *
  * Implements: STUN binding, crypto_box PING/PONG, hole puncher.
- * Uses the injectable crypto backend (X25519 + ChaCha20-Poly1305).
+ * Uses the NaCl crypto_box construction with X25519 from the WireGuard
+ * crypto backend as the DH injector (ADR-0015).
  *
  * Pure C11, no platform headers (ADR-0006). All I/O via port layer.
  */
@@ -10,6 +11,7 @@
 #include "disco.h"
 #include "wg.h"
 #include "tsnode_port.h"
+#include "nacl_box.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -149,7 +151,8 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
             memcpy(st->peers[i].disco_pubkey, disco_pubkey, TSNODE_DISCO_KEY_LEN);
             st->peers[i].n_endpoints = 0;
             if (endpoint_ips != NULL && endpoint_ports != NULL) {
-                for (int j = 0; j < n_eps && j < TSNODE_DISCO_MAX_ENDPOINTS; j++) {
+                unsigned int max_eps = n_eps > 0 ? (unsigned int)n_eps : 0u;
+                for (unsigned int j = 0; j < max_eps && j < TSNODE_DISCO_MAX_ENDPOINTS; j++) {
                     st->peers[i].endpoints[j].ip = endpoint_ips[j];
                     st->peers[i].endpoints[j].port = endpoint_ports[j];
                     st->peers[i].n_endpoints++;
@@ -161,7 +164,7 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
     }
 
     /* Add new peer */
-    if (st->n_peers >= TSNODE_DISCO_MAX_PEERS) {
+    if ((unsigned int)st->n_peers >= TSNODE_DISCO_MAX_PEERS) {
         TSNODE_LOGW(TAG, "disco peer table full");
         return TSNODE_ERR_NO_MEMORY;
     }
@@ -171,7 +174,8 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
     memcpy(peer->disco_pubkey, disco_pubkey, TSNODE_DISCO_KEY_LEN);
     peer->n_endpoints = 0;
     if (endpoint_ips != NULL && endpoint_ports != NULL) {
-        for (int j = 0; j < n_eps && j < TSNODE_DISCO_MAX_ENDPOINTS; j++) {
+        unsigned int max_eps = n_eps > 0 ? (unsigned int)n_eps : 0u;
+        for (unsigned int j = 0; j < max_eps && j < TSNODE_DISCO_MAX_ENDPOINTS; j++) {
             peer->endpoints[j].ip = endpoint_ips[j];
             peer->endpoints[j].port = endpoint_ports[j];
             peer->n_endpoints++;
@@ -217,16 +221,11 @@ static tsnode_disco_peer_t *find_peer_by_disco_key(tsnode_disco_state_t *st,
 
 /* ---- crypto_box operations ---- */
 
-/* Derive the crypto_box key from X25519 shared secret */
-static tsnode_err_t disco_box_derive_key(uint8_t box_key[32],
-                                         const uint8_t sk[32],
-                                         const uint8_t pk[32],
-                                         const tsnode_wg_crypto_t *crypto)
-{
-    return crypto->dh(box_key, sk, pk);
-}
-
-/* Encrypt with crypto_box (ChaCha20-Poly1305) */
+/* Derive the crypto_box shared key from X25519 DH + HSalsa20 fold.
+ * This is the NaCl box.Precompute used by Tailscale disco.
+ * crypto->dh provides X25519; nacl_box adds the HSalsa20(shared,0,sigma)
+ * folding that ChaCha20-era code omitted (and which is required for
+ * wire-interoperability with Tailscale's XSalsa20-Poly1305 secretbox). */
 static tsnode_err_t disco_box_seal(uint8_t *out, size_t *out_len,
                                    const uint8_t *plain, size_t plain_len,
                                    const uint8_t nonce[24],
@@ -234,22 +233,12 @@ static tsnode_err_t disco_box_seal(uint8_t *out, size_t *out_len,
                                    const uint8_t my_priv[32],
                                    const tsnode_wg_crypto_t *crypto)
 {
-    uint8_t box_key[32];
-    tsnode_err_t err = disco_box_derive_key(box_key, my_priv, peer_pub, crypto);
-    if (err != TSNODE_OK) return err;
-
-    /* Use first 12 bytes of 24-byte nonce for ChaCha20-Poly1305 (RFC 8439) */
-    uint8_t nonce12[12];
-    memcpy(nonce12, nonce, 12);
-
-    err = crypto->aead_seal(out, box_key, nonce12, NULL, 0, plain, plain_len);
-    if (err != TSNODE_OK) return err;
-
-    *out_len = plain_len + TSNODE_DISCO_MACBYTES;
-    return TSNODE_OK;
+    return tsnode_nacl_box_seal(out, out_len, plain, plain_len, nonce,
+                                my_priv, peer_pub, crypto->dh);
 }
 
-/* Decrypt with crypto_box */
+/* Decrypt with crypto_box (NaCl XSalsa20-Poly1305). Verify anti-replay
+ * of the DH result and authentication both fail closed inside nacl_box. */
 static tsnode_err_t disco_box_open(uint8_t *plain, size_t *plain_len,
                                    const uint8_t *box, size_t box_len,
                                    const uint8_t nonce[24],
@@ -257,18 +246,8 @@ static tsnode_err_t disco_box_open(uint8_t *plain, size_t *plain_len,
                                    const uint8_t my_priv[32],
                                    const tsnode_wg_crypto_t *crypto)
 {
-    uint8_t box_key[32];
-    tsnode_err_t err = disco_box_derive_key(box_key, my_priv, sender_pub, crypto);
-    if (err != TSNODE_OK) return err;
-
-    uint8_t nonce12[12];
-    memcpy(nonce12, nonce, 12);
-
-    err = crypto->aead_open(plain, box_key, nonce12, NULL, 0, box, box_len);
-    if (err != TSNODE_OK) return err;
-
-    *plain_len = box_len - TSNODE_DISCO_MACBYTES;
-    return TSNODE_OK;
+    return tsnode_nacl_box_open(plain, plain_len, box, box_len, nonce,
+                                my_priv, sender_pub, crypto->dh);
 }
 
 /* ---- Handle incoming disco packet ---- */
@@ -584,7 +563,7 @@ tsnode_err_t tsnode_disco_poll(tsnode_disco_state_t *st,
         }
 
         /* Retry hole-punching */
-        if (peer->retry_count < TSNODE_DISCO_MAX_RETRIES) {
+        if ((unsigned int)peer->retry_count < TSNODE_DISCO_MAX_RETRIES) {
             if (peer->retry_count == 0 ||
                 (now_ms - peer->last_pong_ms) > TSNODE_DISCO_RETRY_MS) {
                 tsnode_disco_send_ping(st, i, udp_sock, crypto);
@@ -594,6 +573,22 @@ tsnode_err_t tsnode_disco_poll(tsnode_disco_state_t *st,
     }
 
     return TSNODE_OK;
+}
+
+/* ---- Get STUN-discovered public endpoint ---- */
+
+bool tsnode_disco_get_stun_endpoint(const tsnode_disco_state_t *st,
+                                    uint32_t *ip_out, uint16_t *port_out)
+{
+    if (st == NULL || ip_out == NULL || port_out == NULL) {
+        return false;
+    }
+    if (!st->stun.discovered) {
+        return false;
+    }
+    *ip_out = st->stun.public_ip;
+    *port_out = st->stun.public_port;
+    return true;
 }
 
 /* ---- Get best endpoint ---- */

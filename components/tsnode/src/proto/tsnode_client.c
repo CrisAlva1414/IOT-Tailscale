@@ -973,9 +973,32 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
     return TSNODE_OK;
 }
 
+/* Si STUN ya descubrió nuestro endpoint público (GOAL-3), reemplazamos
+ * la IP local WiFi (192.168.x.x) del config por la pública para que el
+ * control plane la use como endpoint alcanzable desde internet. El puerto
+ * STUN-descubierto es el puerto NAT externo del socket WG; es el correcto
+ * a reportar (el control plane lo usa como Magicsock UDP endpoint). */
+static void apply_stun_endpoint_to_config(void)
+{
+    if (!s_disco_initialized) return;
+
+    uint32_t pub_ip;
+    uint16_t pub_port;
+    if (tsnode_disco_get_stun_endpoint(&s_disco, &pub_ip, &pub_port)) {
+        s_config.endpoint_ip = pub_ip;
+        s_config.endpoint_port = pub_port;
+        TSNODE_LOGI(TAG, "MapRequest endpoint -> STUN public %u.%u.%u.%u:%u",
+                    (pub_ip >> 24) & 0xFF, (pub_ip >> 16) & 0xFF,
+                    (pub_ip >> 8) & 0xFF, pub_ip & 0xFF, pub_port);
+    }
+}
+
 static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
 {
     tsnode_err_t err;
+
+    /* Use STUN-discovered public endpoint if available (GOAL-3) */
+    apply_stun_endpoint_to_config();
 
     /* Build MapRequest */
     const uint8_t *disco_key = tsnode_disco_get_pubkey(&s_disco);
