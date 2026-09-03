@@ -19,10 +19,40 @@
 #include "x25519_wrapper.h"
 #include "base64.h"
 #include "wg.h"
+#include "disco.h"
 
 /* Port layer provides all platform abstractions (ADR-0006) */
 
 #define TAG "tsnode_client"
+
+/* ---- WG packet counters (Fase 1 instrumentation) ---- */
+typedef struct {
+    uint32_t tx_initiation;
+    uint32_t tx_response;
+    uint32_t tx_transport;
+    uint32_t rx_initiation;
+    uint32_t rx_response;
+    uint32_t rx_transport;
+    uint32_t rx_keepalive;
+    uint32_t rx_unknown;
+    uint32_t rx_errors;
+} wg_pkt_counters_t;
+
+static wg_pkt_counters_t s_wg_counters;
+
+static void wg_log_counters(void)
+{
+    TSNODE_LOGI(TAG, "WG counters: TX init=%lu resp=%lu data=%lu | RX init=%lu resp=%lu data=%lu keep=%lu err=%lu unk=%lu",
+                (unsigned long)s_wg_counters.tx_initiation,
+                (unsigned long)s_wg_counters.tx_response,
+                (unsigned long)s_wg_counters.tx_transport,
+                (unsigned long)s_wg_counters.rx_initiation,
+                (unsigned long)s_wg_counters.rx_response,
+                (unsigned long)s_wg_counters.rx_transport,
+                (unsigned long)s_wg_counters.rx_keepalive,
+                (unsigned long)s_wg_counters.rx_errors,
+                (unsigned long)s_wg_counters.rx_unknown);
+}
 
 /* Persistencia de identidad (ADR-0003): machine key + node key vía el KV
  * del port (NVS en ESP-IDF). En banco de pruebas sin flash encryption los
@@ -96,8 +126,30 @@ static h2_conn_t s_h2;
 static uint8_t s_reg_resp[REGISTER_RESPONSE_BUF_SIZE];
 static uint8_t s_map_resp[MAP_RESPONSE_BUF_SIZE];
 
+/* ---- Timestamp helper for packet logging ---- */
+static uint64_t s_start_ms = 0;
+
+static void ts_init(void)
+{
+    if (s_start_ms == 0) {
+        tsnode_port_uptime_ms(&s_start_ms);
+    }
+}
+
+/* Returns milliseconds since s_start_ms (session-relative timestamp) */
+static uint64_t ts_rel_ms(void)
+{
+    uint64_t now;
+    tsnode_port_uptime_ms(&now);
+    return now - s_start_ms;
+}
+
 /* Forward declarations for WireGuard integration (ADR-0011) */
 static tsnode_err_t init_wg_device(void);
+
+/* Forward declarations for Disco (ADR-0014) */
+static tsnode_disco_state_t s_disco;
+static bool s_disco_initialized = false;
 static tsnode_err_t init_wg_socket(void);
 static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap);
 
@@ -696,12 +748,13 @@ static tsnode_err_t do_connect(void)
 
     /* Step 9: Map sync via POST /machine/map (h2). */
     set_state(TSNODE_CLIENT_MAP_SYNC);
+    const uint8_t *dk = tsnode_disco_get_pubkey(&s_disco);
     uint8_t zero_disco[32] = {0};
     char map_req[MAP_REQUEST_BUF_SIZE];
     size_t map_req_len;
     err = tsnode_map_build_request(map_req, sizeof(map_req), &map_req_len,
                                     s_node_key_pub,
-                                    zero_disco,
+                                    dk ? dk : zero_disco,
                                     s_config.hostname,
                                     145, false,
                                     s_config.endpoint_ip,
@@ -769,6 +822,17 @@ static tsnode_err_t init_wg_device(void)
         return err;
     }
     TSNODE_LOGI(TAG, "WireGuard device initialized");
+
+    /* Initialize disco subsystem (ADR-0014) */
+    err = tsnode_disco_load_or_generate(&s_disco, s_node_key_pub, crypto);
+    if (err != TSNODE_OK) {
+        TSNODE_LOGW(TAG, "disco init failed: %d (data plane will not work behind NAT)", err);
+        /* Non-fatal: data plane may still work for direct connections */
+    } else {
+        s_disco_initialized = true;
+        TSNODE_LOGI(TAG, "Disco subsystem initialized");
+    }
+
     return TSNODE_OK;
 }
 
@@ -816,13 +880,35 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
             cfg.allowed_ip = mp->allowed_ip;
             cfg.allowed_mask = mp->allowed_mask;
 
-            idx = tsnode_wg_peer_add(&s_wg_dev, &cfg);
-            if (idx < 0) {
-                TSNODE_LOGW(TAG, "WG peer_add failed (full or dup?)");
-                continue;
+        idx = tsnode_wg_peer_add(&s_wg_dev, &cfg);
+        if (idx < 0) {
+            TSNODE_LOGW(TAG, "WG peer_add failed (full or dup?)");
+            continue;
+        }
+        TSNODE_LOGI(TAG, "WG peer added: idx=%d key=...%02x%02x", idx,
+                    mp->key[30], mp->key[31]);
+
+        /* Register peer in disco subsystem if we have a disco key */
+        if (s_disco_initialized) {
+            bool has_disco_key = false;
+            for (int k = 0; k < 32; k++) {
+                if (mp->disco_key[k] != 0) { has_disco_key = true; break; }
             }
-            TSNODE_LOGI(TAG, "WG peer added: idx=%d key=...%02x%02x", idx,
-                        mp->key[30], mp->key[31]);
+            if (has_disco_key) {
+                uint32_t ep_ip = 0;
+                if (mp->endpoint_port > 0) {
+                    unsigned a, b, c, d;
+                    if (sscanf(mp->endpoint_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                        ep_ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                                ((uint32_t)c << 8) | (uint32_t)d;
+                    }
+                }
+                tsnode_disco_add_peer(&s_disco, mp->key, mp->disco_key,
+                                      ep_ip ? &ep_ip : NULL,
+                                      mp->endpoint_port ? &mp->endpoint_port : NULL,
+                                      ep_ip ? 1 : 0);
+            }
+        }
         }
 
         /* Initiate handshake if no active session */
@@ -848,13 +934,13 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
             ts[11] = (uint8_t)(nsec);
 
             uint8_t initiation[TSNODE_WG_INITIATION_LEN];
-            TSNODE_LOGI(TAG, "WG creating initiation for peer %d (key=%02x%02x)", idx, mp->key[30], mp->key[31]);
+            TSNODE_LOGI(TAG, "WG TX initiation peer=%d key=...%02x%02x", idx, mp->key[30], mp->key[31]);
             err = tsnode_wg_create_initiation(&s_wg_dev, idx, ts, initiation);
             if (err != TSNODE_OK) {
                 TSNODE_LOGE(TAG, "WG create_initiation failed: %d (peer %d)", err, idx);
                 continue;
             }
-            TSNODE_LOGI(TAG, "WG initiation created OK (%d bytes)", TSNODE_WG_INITIATION_LEN);
+            TSNODE_LOGI(TAG, "WG TX initiation ready %d bytes t=%lu ms", TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
 
             /* Parse endpoint IP for sendto */
             uint32_t ep_ip = 0;
@@ -871,10 +957,15 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
                                           sizeof(initiation),
                                           ep_ip, mp->endpoint_port);
             if (err != TSNODE_OK) {
-                TSNODE_LOGW(TAG, "WG initiation send failed: %d", err);
+                TSNODE_LOGW(TAG, "WG TX initiation FAILED: %d peer=%d dst=%s:%u t=%lu ms",
+                            err, idx, mp->endpoint_ip, mp->endpoint_port,
+                            (unsigned long)ts_rel_ms());
             } else {
-                TSNODE_LOGI(TAG, "WG initiation sent to %s:%u",
-                            mp->endpoint_ip, mp->endpoint_port);
+                s_wg_counters.tx_initiation++;
+                TSNODE_LOGI(TAG, "WG TX init #%lu -> %s:%u len=%d t=%lu ms",
+                            (unsigned long)s_wg_counters.tx_initiation,
+                            mp->endpoint_ip, mp->endpoint_port,
+                            TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
             }
         }
     }
@@ -887,12 +978,13 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
     tsnode_err_t err;
 
     /* Build MapRequest */
+    const uint8_t *disco_key = tsnode_disco_get_pubkey(&s_disco);
     uint8_t zero_disco[32] = {0};
     char map_req[MAP_REQUEST_BUF_SIZE];
     size_t map_req_len;
     err = tsnode_map_build_request(map_req, sizeof(map_req), &map_req_len,
                                     s_node_key_pub,
-                                    zero_disco,
+                                    disco_key ? disco_key : zero_disco,
                                     s_config.hostname,
                                     145, false,
                                     s_config.endpoint_ip,
@@ -956,8 +1048,13 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
     if (netmap->peer_count > 0) {
         for (uint8_t i = 0; i < netmap->peer_count && i < 3; i++) {
             const tsnode_map_peer_t *p = &netmap->peers[i];
-            TSNODE_LOGI(TAG, "peer[%d]: ip=%s ep=%s:%u",
-                        i, p->tailscale_ip, p->endpoint_ip, p->endpoint_port);
+            bool has_dk = false;
+            for (int k = 0; k < 32; k++) {
+                if (p->disco_key[k] != 0) { has_dk = true; break; }
+            }
+            TSNODE_LOGI(TAG, "peer[%d]: ip=%s ep=%s:%u disco=%s",
+                        i, p->tailscale_ip, p->endpoint_ip, p->endpoint_port,
+                        has_dk ? "yes" : "no");
         }
     }
 
@@ -995,14 +1092,32 @@ static void wg_recv_task(void *arg)
             continue; /* Too short for any WG message */
         }
 
+        /* Demultiplex: disco magic vs WireGuard */
+        if (s_disco_initialized && tsnode_disco_is_disco_packet(pkt_buf, nread)) {
+            /* Disco packet - handle in disco subsystem */
+            tsnode_disco_handle_packet(&s_disco, pkt_buf, nread,
+                                       src_ip, src_port, s_wg_sock,
+                                       tsnode_wg_crypto_mbedtls());
+            continue;
+        }
+
+        /* STUN Binding Success Response (from our STUN/DERP server) */
+        if (s_disco_initialized && tsnode_disco_is_stun_response(pkt_buf, nread)) {
+            tsnode_disco_stun_parse_response(&s_disco, pkt_buf, nread);
+            continue;
+        }
+
         /* Determine message type from first byte */
         uint8_t msg_type = pkt_buf[0];
 
         switch (msg_type) {
         case TSNODE_WG_MSG_TYPE_HANDSHAKE_INITIATION: {
-            TSNODE_LOGI(TAG, "WG recv initiation from %u.%u.%u.%u:%u",
+            s_wg_counters.rx_initiation++;
+            TSNODE_LOGI(TAG, "WG RX init #%lu from %u.%u.%u.%u:%u len=%zu t=%lu ms",
+                        (unsigned long)s_wg_counters.rx_initiation,
                         (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
-                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port);
+                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                        nread, (unsigned long)ts_rel_ms());
 
             int peer_idx = -1;
             err = tsnode_wg_consume_initiation(&s_wg_dev, pkt_buf, nread,
@@ -1037,9 +1152,12 @@ static void wg_recv_task(void *arg)
         }
 
         case TSNODE_WG_MSG_TYPE_HANDSHAKE_RESPONSE: {
-            TSNODE_LOGI(TAG, "WG recv response from %u.%u.%u.%u:%u",
+            s_wg_counters.rx_response++;
+            TSNODE_LOGI(TAG, "WG RX resp #%lu from %u.%u.%u.%u:%u len=%zu t=%lu ms",
+                        (unsigned long)s_wg_counters.rx_response,
                         (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
-                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port);
+                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                        nread, (unsigned long)ts_rel_ms());
 
             int peer_idx = -1;
             uint64_t now_ms;
@@ -1050,7 +1168,7 @@ static void wg_recv_task(void *arg)
                 TSNODE_LOGW(TAG, "WG consume_response failed: %d", err);
                 continue;
             }
-            TSNODE_LOGI(TAG, "WG session established with peer %d", peer_idx);
+            TSNODE_LOGI(TAG, "WG session ESTABLISHED peer=%d t=%lu ms", peer_idx, (unsigned long)ts_rel_ms());
             break;
         }
 
@@ -1071,113 +1189,196 @@ static void wg_recv_task(void *arg)
 
             if (inner_len == 0) {
                 /* Keepalive (empty payload) */
-                TSNODE_LOGI(TAG, "WG keepalive from peer %d", peer_idx);
+                s_wg_counters.rx_keepalive++;
+                TSNODE_LOGI(TAG, "WG RX keepalive #%lu peer=%d t=%lu ms",
+                            (unsigned long)s_wg_counters.rx_keepalive,
+                            peer_idx, (unsigned long)ts_rel_ms());
             } else {
                 /* Inner IP packet — for v1, log and drop (no TUN) */
-                TSNODE_LOGI(TAG, "WG data from peer %d: %zu bytes (no TUN yet)",
-                            peer_idx, inner_len);
+                s_wg_counters.rx_transport++;
+                TSNODE_LOGI(TAG, "WG RX data #%lu peer=%d %zu bytes (no TUN) t=%lu ms",
+                            (unsigned long)s_wg_counters.rx_transport,
+                            peer_idx, inner_len, (unsigned long)ts_rel_ms());
             }
             break;
         }
 
         default:
-            /* Unknown WG message type */
-            TSNODE_LOGW(TAG, "WG unknown msg type %u from %u.%u.%u.%u:%u",
-                        msg_type,
+            /* Unknown WG message type — could be disco (handled in Phase 2) */
+            s_wg_counters.rx_unknown++;
+            TSNODE_LOGW(TAG, "WG RX unknown type=%u #%lu from %u.%u.%u.%u:%u len=%zu t=%lu ms",
+                        msg_type, (unsigned long)s_wg_counters.rx_unknown,
                         (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
-                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port);
+                        (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                        nread, (unsigned long)ts_rel_ms());
             break;
         }
     }
 
+    wg_log_counters();
     TSNODE_LOGI(TAG, "WG recv task exiting");
     tsnode_port_task_delete_self();
 }
 
+/* ---- Session cleanup between reconnection attempts ---- */
+
+/* Release all resources held by an active or partially-active session so
+ * that the next do_connect() starts from a clean state.  Fixes:
+ *   B1 — UDP socket was leaked on every do_connect error path.
+ *   A1 — needed by the reconnection loop to cleanly tear down before retry. */
+static void cleanup_session(void)
+{
+    ts2021_conn_close(&s_conn);
+
+    if (s_wg_sock != NULL) {
+        tsnode_port_udp_close(s_wg_sock);
+        s_wg_sock = NULL;
+    }
+
+    /* Reset h2 pushback buffer so stale bytes from the previous session
+     * don't corrupt the next HTTP/2 stream. */
+    s_h2_pushback_len = 0;
+
+    /* Force disco re-init on next successful connect so the keypair is
+     * reloaded from NVS (it may have been persisted from the previous
+     * session; we want a consistent state). */
+    s_disco_initialized = false;
+
+    memset(&s_h2, 0, sizeof(s_h2));
+}
+
 /* ---- Task entry point (called by port task) ---- */
+
+/* Reconnection backoff schedule (seconds).  First retry is immediate,
+ * then exponential up to a cap.  The backoff resets after the node has
+ * been successfully ONLINE for at least one full poll cycle. */
+#define RECONNECT_BACKOFF_MIN_S   5
+#define RECONNECT_BACKOFF_MAX_S  60
 
 static void client_task(void *arg)
 {
     (void)arg;
     TSNODE_LOGI(TAG, "client task started");
+    ts_init();
 
-    tsnode_err_t err = do_connect();
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "connect failed: %s (%d)",
-                    tsnode_err_name(err), err);
-        set_state(TSNODE_CLIENT_ERROR);
-        tsnode_port_task_delete_self();
-        return;
-    }
-
-    /* Start WireGuard UDP receive task (ADR-0011) */
-    err = tsnode_port_task_create(wg_recv_task, NULL,
-                                   "wg_recv", 8192, 4);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "WG recv task create failed: %d", err);
-        /* Non-fatal: data plane won't work but control plane is fine */
-    }
-
-    /* Connected and registered. Enter polling loop. */
-    uint32_t poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
+    uint32_t reconnect_backoff_s = 0;
     uint32_t consecutive_errors = 0;
 
-    while (s_state == TSNODE_CLIENT_ONLINE) {
-        /* Sleep with jitter */
-        uint32_t jitter = (poll_interval_s * MAP_POLL_JITTER_PCT) / 100;
-        uint32_t sleep_s = poll_interval_s;
-        if (jitter > 0) {
-            /* Simple pseudo-jitter: add/subtract based on uptime */
-            uint64_t uptime_ms;
-            tsnode_port_uptime_ms(&uptime_ms);
-            uint32_t tick = (uint32_t)(uptime_ms / 1000);
-            if ((tick % 100) < 50) {
-                sleep_s += (tick % jitter);
-            } else {
-                sleep_s -= (tick % jitter);
+    while (s_state != TSNODE_CLIENT_IDLE) {
+        /* Backoff before retry (skip on first iteration).
+         * Sleep in 1-second chunks so tsnode_client_stop() is responsive. */
+        if (reconnect_backoff_s > 0) {
+            TSNODE_LOGI(TAG, "reconnect in %us", reconnect_backoff_s);
+            for (uint32_t i = 0; i < reconnect_backoff_s; i++) {
+                if (s_state == TSNODE_CLIENT_IDLE) break;
+                tsnode_port_delay_ms(1000);
             }
+            if (s_state == TSNODE_CLIENT_IDLE) break;
         }
-        /* Delay using port layer */
-        tsnode_port_delay_ms(sleep_s * 1000);
 
-        /* Check if we should stop */
-        if (s_state != TSNODE_CLIENT_ONLINE) break;
+        /* Clean up any leftover state from previous session */
+        cleanup_session();
 
-        /* Poll map */
-        tsnode_map_netmap_t netmap;
-        tsnode_err_t poll_err = do_map_poll(&netmap);
-        if (poll_err != TSNODE_OK) {
+        /* ---- Connect phase ---- */
+        tsnode_err_t err = do_connect();
+        if (err != TSNODE_OK) {
+            TSNODE_LOGE(TAG, "connect failed: %s (%d) — retrying",
+                        tsnode_err_name(err), err);
+            set_state(TSNODE_CLIENT_ERROR);
+            reconnect_backoff_s = RECONNECT_BACKOFF_MIN_S *
+                                  (1 << (consecutive_errors < 4 ? consecutive_errors : 4));
+            if (reconnect_backoff_s > RECONNECT_BACKOFF_MAX_S) {
+                reconnect_backoff_s = RECONNECT_BACKOFF_MAX_S;
+            }
             consecutive_errors++;
-            poll_interval_s = MAP_POLL_INTERVAL_BASE_S * (1 << (consecutive_errors < 5 ? consecutive_errors : 5));
-            if (poll_interval_s > MAP_POLL_INTERVAL_MAX_S) {
-                poll_interval_s = MAP_POLL_INTERVAL_MAX_S;
-            }
-            TSNODE_LOGW(TAG, "map poll error, backoff to %us", poll_interval_s);
-
-            /* Too many errors: try to reconnect */
-            if (consecutive_errors >= 3) {
-                TSNODE_LOGE(TAG, "too many map errors, reconnecting");
-                ts2021_conn_close(&s_conn);
-                set_state(TSNODE_CLIENT_ERROR);
-                break;
-            }
             continue;
         }
 
-        /* Success: reset backoff */
+        /* ---- Connected: enter polling loop ---- */
+        TSNODE_LOGI(TAG, "connected — entering poll loop");
         consecutive_errors = 0;
-        poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
+        reconnect_backoff_s = 0;
 
-        /* Update WireGuard peers from netmap (ADR-0011) */
-        tsnode_err_t wg_err = update_wg_peers(&netmap);
-        if (wg_err != TSNODE_OK) {
-            TSNODE_LOGW(TAG, "WG peer update failed: %d", wg_err);
+        /* Start WireGuard UDP receive task (ADR-0011) */
+        err = tsnode_port_task_create(wg_recv_task, NULL,
+                                       "wg_recv", 8192, 4);
+        if (err != TSNODE_OK) {
+            TSNODE_LOGE(TAG, "WG recv task create failed: %d", err);
+            /* Non-fatal: data plane won't work but control plane is fine */
         }
+
+        uint32_t poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
+        uint32_t poll_consecutive_errors = 0;
+
+        while (s_state == TSNODE_CLIENT_ONLINE) {
+            /* Sleep with jitter */
+            uint32_t jitter = (poll_interval_s * MAP_POLL_JITTER_PCT) / 100;
+            uint32_t sleep_s = poll_interval_s;
+            if (jitter > 0) {
+                uint64_t uptime_ms;
+                tsnode_port_uptime_ms(&uptime_ms);
+                uint32_t tick = (uint32_t)(uptime_ms / 1000);
+                if ((tick % 100) < 50) {
+                    sleep_s += (tick % jitter);
+                } else {
+                    sleep_s -= (tick % jitter);
+                }
+            }
+            /* Sleep in 1-second chunks so tsnode_client_stop() is responsive */
+            for (uint32_t i = 0; i < sleep_s; i++) {
+                if (s_state != TSNODE_CLIENT_ONLINE) break;
+                tsnode_port_delay_ms(1000);
+            }
+
+            if (s_state != TSNODE_CLIENT_ONLINE) break;
+
+            tsnode_map_netmap_t netmap;
+            tsnode_err_t poll_err = do_map_poll(&netmap);
+            if (poll_err != TSNODE_OK) {
+                poll_consecutive_errors++;
+                poll_interval_s = MAP_POLL_INTERVAL_BASE_S *
+                                  (1 << (poll_consecutive_errors < 5 ? poll_consecutive_errors : 5));
+                if (poll_interval_s > MAP_POLL_INTERVAL_MAX_S) {
+                    poll_interval_s = MAP_POLL_INTERVAL_MAX_S;
+                }
+                TSNODE_LOGW(TAG, "map poll error, backoff to %us",
+                            poll_interval_s);
+
+                if (poll_consecutive_errors >= 3) {
+                    TSNODE_LOGE(TAG, "too many map poll errors — "
+                                "dropping connection for reconnect");
+                    break;  /* exit poll loop → outer loop reconnects */
+                }
+                continue;
+            }
+
+            /* Success: reset poll backoff */
+            poll_consecutive_errors = 0;
+            poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
+
+            wg_log_counters();
+
+            tsnode_err_t wg_err = update_wg_peers(&netmap);
+            if (wg_err != TSNODE_OK) {
+                TSNODE_LOGW(TAG, "WG peer update failed: %d", wg_err);
+            }
+
+            if (s_disco_initialized) {
+                uint32_t stun_ip = netmap.stun.valid ? netmap.stun.ip : 0;
+                uint16_t stun_port = netmap.stun.valid ? netmap.stun.port : 0;
+                tsnode_disco_poll(&s_disco, stun_ip, stun_port, s_wg_sock,
+                                  tsnode_wg_crypto_mbedtls());
+            }
+        }
+
+        /* Poll loop exited — reconnect unless stop was requested */
+        TSNODE_LOGI(TAG, "poll loop exited (state=%d)", (int)s_state);
+        reconnect_backoff_s = RECONNECT_BACKOFF_MIN_S;
     }
 
+    /* Clean exit: user called tsnode_client_stop() */
+    cleanup_session();
     TSNODE_LOGI(TAG, "client task exiting (state=%d)", (int)s_state);
-
-    /* Task self-deletes via port (ADR-0006) */
     tsnode_port_task_delete_self();
 }
 

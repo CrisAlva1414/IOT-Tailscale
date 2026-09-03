@@ -23,6 +23,13 @@ extern "C" {
 /* Maximum peers we track (ESP32 memory constraint) */
 #define TSNODE_MAP_MAX_PEERS 16
 
+/* STUN server from DERP map */
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    bool valid;
+} tsnode_map_stun_t;
+
 /* Parsed peer info (minimal subset of tailcfg.Node for data plane) */
 typedef struct {
     uint8_t key[32];          /* WireGuard public key */
@@ -34,6 +41,7 @@ typedef struct {
     uint16_t endpoint_port;   /* peer UDP port from Endpoints */
     uint16_t listen_port;     /* WG listen port (may differ from endpoint_port) */
     uint8_t  preshared_key[32]; /* PSK (all-zero = none) */
+    uint8_t  disco_key[32];   /* Disco public key (all-zero = none) */
     bool     online;          /* currently connected */
 } tsnode_map_peer_t;
 
@@ -43,6 +51,7 @@ typedef struct {
     uint8_t  peer_count;
     char     self_ip[16];       /* our 100.x.y.z */
     uint8_t  self_node_key[32]; /* our node public key */
+    tsnode_map_stun_t stun;    /* first STUN server from DERPMap */
     bool     dns_enabled;
 } tsnode_map_netmap_t;
 

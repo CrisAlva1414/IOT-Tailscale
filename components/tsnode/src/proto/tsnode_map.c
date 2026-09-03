@@ -373,11 +373,84 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
                 }
             }
 
+            /* Find DiscoKey — hex-encoded 32-byte key (discokey:hex) */
+            const char *dk = strstr(peer_start, "\"DiscoKey\"");
+            if (dk != NULL) {
+                /* Skip past the "DiscoKey" key literal to the ':' then value */
+                const char *colon = strchr(dk + strlen("\"DiscoKey\""), ':');
+                if (colon != NULL) {
+                    const char *dk_hex = colon + 1;
+                    /* Skip whitespace and opening quote */
+                    while (*dk_hex == ' ' || *dk_hex == '\t') dk_hex++;
+                    if (*dk_hex == '"') dk_hex++;
+                    /* Check for "discokey:" prefix (Tailscale uses "discokey:hex") */
+                    if (strncmp(dk_hex, "discokey:", 9) == 0) dk_hex += 9;
+                    size_t hlen = 0;
+                    uint8_t c;
+                    while ((c = (uint8_t)dk_hex[hlen]) != '\0' && c != '"' &&
+                           ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                            (c >= 'A' && c <= 'F'))) {
+                        hlen++;
+                    }
+                    if (hlen >= 64) {
+                        hex_to_bytes(peer->disco_key, 32, dk_hex, 64);
+                    }
+                }
+            }
+
             peer->online = (peer->endpoint_port > 0);
             netmap->peer_count++;
 
             /* Move past this peer object */
             scan = key_end;
+        }
+    }
+
+    /* Parse DERPMap for STUN server.
+     * Tailscale MapResponse does NOT have a dedicated "STUNIPv4" field.
+     * DERP nodes have "IPv4" which serves as both DERP and STUN endpoint.
+     * Find the first DERP node's IPv4 (1234 is the standard STUN port).
+     * Also check for explicit STUNIPv4/STUNPort if future versions add it. */
+    netmap->stun.valid = false;
+
+    /* Try explicit STUNIPv4 first (future-proof) */
+    const char *stun_marker = "\"STUNIPv4\"";
+    const char *stun_ip_str = strstr(json, stun_marker);
+    if (stun_ip_str != NULL) {
+        stun_ip_str += strlen(stun_marker);
+        while (*stun_ip_str && *stun_ip_str != '"') stun_ip_str++;
+        stun_ip_str++;
+        unsigned a, b, c, d;
+        if (sscanf(stun_ip_str, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+            netmap->stun.ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                              ((uint32_t)c << 8) | (uint32_t)d;
+            const char *port_marker = "\"STUNPort\"";
+            const char *port_str = strstr(stun_ip_str, port_marker);
+            if (port_str != NULL) {
+                port_str += strlen(port_marker);
+                while (*port_str && (*port_str < '0' || *port_str > '9')) port_str++;
+                netmap->stun.port = (uint16_t)atoi(port_str);
+            }
+            if (netmap->stun.port == 0) netmap->stun.port = 3478;
+            netmap->stun.valid = true;
+        }
+    }
+
+    /* Fallback: use first DERP node's IPv4 as STUN server (default port 3478) */
+    if (!netmap->stun.valid) {
+        const char *ip_marker = "\"IPv4\"";
+        const char *ip_str = strstr(json, ip_marker);
+        if (ip_str != NULL) {
+            ip_str += strlen(ip_marker);
+            while (*ip_str && *ip_str != '"') ip_str++;
+            ip_str++;
+            unsigned a, b, c, d;
+            if (sscanf(ip_str, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                netmap->stun.ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                                  ((uint32_t)c << 8) | (uint32_t)d;
+                netmap->stun.port = 3478;
+                netmap->stun.valid = true;
+            }
         }
     }
 

@@ -19,6 +19,9 @@
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
 
+/* lwIP socket options: TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT (A3) */
+#include <lwip/sockets.h>
+
 #include "tsnode_port.h"
 
 static const char *TAG = "tsnode_port_net";
@@ -89,6 +92,32 @@ tsnode_err_t tsnode_port_tcp_connect(tsnode_port_socket_t **out_sock,
         mbedtls_net_free(&s->net);
         free(s);
         return TSNODE_ERR_NETWORK;
+    }
+
+    /* Apply read timeout on the raw socket so mbedtls_net_recv does not
+     * block forever on a dead connection (fix: A2).  Without this, a
+     * silent TCP close or NAT timeout causes the task to hang. */
+    if (timeout_ms > 0) {
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        setsockopt(s->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    /* TCP keepalive to prevent NAT/firewall from dropping idle connections
+     * between map polls (fix: A3).  Default: idle 60s, probe every 10s,
+     * give up after 3 probes.  The control-plane TCP sits idle for ~30s
+     * between MapRequest/MapResponse exchanges; without keepalive the
+     * NAT mapping may expire. */
+    {
+        int yes = 1;
+        setsockopt(s->net.fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+        int idle_s = 60;   /* seconds before first probe */
+        int intvl_s = 10;  /* seconds between probes */
+        int cnt = 3;       /* failed probes before giving up */
+        setsockopt(s->net.fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof(idle_s));
+        setsockopt(s->net.fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof(intvl_s));
+        setsockopt(s->net.fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
     }
 
     s->use_tls = false;
@@ -236,6 +265,19 @@ tsnode_err_t tsnode_port_socket_read(tsnode_port_socket_t *sock,
         return TSNODE_ERR_INVALID_ARG;
     }
 
+    /* For non-TLS sockets: apply SO_RCVTIMEO so that mbedtls_net_recv
+     * (which calls recv() internally) returns EAGAIN instead of blocking
+     * forever on a dead or idle connection (fix: A2).
+     * The timeout is also set once in tsnode_port_tcp_connect for the
+     * lifetime of the socket; this per-call set handles cases where the
+     * caller uses a different timeout than the connect-time default. */
+    if (!sock->use_tls && timeout_ms > 0) {
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        setsockopt(sock->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     int ret;
     if (sock->use_tls) {
         ret = mbedtls_ssl_read(&sock->ssl, buf, buf_size);
@@ -321,6 +363,13 @@ tsnode_err_t tsnode_port_udp_bind(tsnode_port_udp_socket_t **out_sock,
     /* Non-blocking for timeout-aware receive */
     int flags = fcntl(s->fd, F_GETFL, 0);
     fcntl(s->fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* SO_REUSEADDR: allow rebinding even if a stale socket from a previous
+     * session still holds the port.  Without this, a failed reconnection
+     * attempt leaks the fd and the next bind() fails with EADDRINUSE until
+     * the device is rebooted (fix: B2). */
+    int reuse = 1;
+    setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     /* Enable broadcast (needed for WireGuard discovery) */
     int broadcast = 1;
