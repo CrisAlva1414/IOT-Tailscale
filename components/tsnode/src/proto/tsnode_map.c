@@ -333,28 +333,36 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
                 }
             }
 
-            /* Find Endpoints — format: "Endpoints":["ip:port",...] */
+            /* Find Endpoints — format: "Endpoints":["ip:port",...]
+             * Parse ALL endpoints up to TSNODE_MAP_MAX_ENDPOINTS. */
             const char *ep = strstr(peer_start, "\"Endpoints\"");
             if (ep != NULL) {
-                /* Find opening bracket [ */
                 const char *bracket = strchr(ep + 12, '[');
                 if (bracket != NULL) {
-                    /* Find first quoted string after [ */
-                    const char *ep_str = strchr(bracket + 1, '"');
-                    if (ep_str != NULL) {
-                        ep_str++; /* skip opening quote */
+                    const char *scan_ep = bracket + 1;
+                    while (peer->n_endpoints < TSNODE_MAP_MAX_ENDPOINTS) {
+                        const char *q = strchr(scan_ep, '"');
+                        if (q == NULL || q[1] == ']') break;
+                        q++; /* skip opening quote */
                         /* Copy IP until colon */
                         size_t iplen = 0;
-                        while (*ep_str && *ep_str != ':' &&
-                               iplen < sizeof(peer->endpoint_ip) - 1) {
-                            peer->endpoint_ip[iplen++] = *ep_str++;
+                        while (*q && *q != ':' &&
+                               iplen < sizeof(peer->endpoints[0].ip) - 1) {
+                            peer->endpoints[peer->n_endpoints].ip[iplen++] = *q++;
                         }
-                        peer->endpoint_ip[iplen] = '\0';
+                        peer->endpoints[peer->n_endpoints].ip[iplen] = '\0';
                         /* Parse port after colon */
-                        if (*ep_str == ':') {
-                            peer->endpoint_port = (uint16_t)atoi(ep_str + 1);
+                        if (*q == ':') {
+                            peer->endpoints[peer->n_endpoints].port =
+                                (uint16_t)atoi(q + 1);
                         }
-                        peer->listen_port = peer->endpoint_port;
+                        if (peer->endpoints[peer->n_endpoints].port > 0) {
+                            peer->n_endpoints++;
+                        }
+                        /* Advance past this quoted string */
+                        const char *end_q = strchr(q, '"');
+                        if (end_q == NULL) break;
+                        scan_ep = end_q + 1;
                     }
                 }
             }
@@ -398,7 +406,7 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
                 }
             }
 
-            peer->online = (peer->endpoint_port > 0);
+            peer->online = (peer->n_endpoints > 0);
             netmap->peer_count++;
 
             /* Move past this peer object */

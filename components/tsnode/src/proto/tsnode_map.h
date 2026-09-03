@@ -23,6 +23,9 @@ extern "C" {
 /* Maximum peers we track (ESP32 memory constraint) */
 #define TSNODE_MAP_MAX_PEERS 16
 
+/* Maximum endpoints per peer (matches disco layer) */
+#define TSNODE_MAP_MAX_ENDPOINTS 4
+
 /* STUN server from DERP map */
 typedef struct {
     uint32_t ip;
@@ -37,9 +40,12 @@ typedef struct {
     char    tailscale_ip[16]; /* "100.x.y.z" (first AllowedIP) */
     uint32_t allowed_ip;      /* host byte order, e.g. 0x64000001 = 100.0.0.1 */
     uint32_t allowed_mask;    /* host byte order, e.g. 0xFFFFFFFF = /32 */
-    char    endpoint_ip[16];  /* peer public IP from Endpoints */
-    uint16_t endpoint_port;   /* peer UDP port from Endpoints */
-    uint16_t listen_port;     /* WG listen port (may differ from endpoint_port) */
+    /* Multiple endpoints per peer (LAN private, public, etc.) */
+    struct {
+        char    ip[16];
+        uint16_t port;
+    } endpoints[TSNODE_MAP_MAX_ENDPOINTS];
+    uint8_t  n_endpoints;     /* number of valid endpoints (0 = unreachable) */
     uint8_t  preshared_key[32]; /* PSK (all-zero = none) */
     uint8_t  disco_key[32];   /* Disco public key (all-zero = none) */
     bool     online;          /* currently connected */

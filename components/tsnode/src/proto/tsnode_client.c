@@ -873,7 +873,7 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
         const tsnode_map_peer_t *mp = &netmap->peers[i];
 
         /* Skip peers without endpoint (unreachable) */
-        if (mp->endpoint_port == 0 || mp->endpoint_ip[0] == '\0') {
+        if (mp->n_endpoints == 0) {
             continue;
         }
 
@@ -895,30 +895,42 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
         TSNODE_LOGI(TAG, "WG peer added: idx=%d key=...%02x%02x", idx,
                     mp->key[30], mp->key[31]);
 
-        /* Register peer in disco subsystem if we have a disco key */
+        /* Register peer in disco subsystem if we have a disco key.
+         * Pass ALL parsed endpoints so disco can try LAN-private and
+         * public candidates (multi-endpoint, ADR-0017). */
         if (s_disco_initialized) {
             bool has_disco_key = false;
             for (int k = 0; k < 32; k++) {
                 if (mp->disco_key[k] != 0) { has_disco_key = true; break; }
             }
-            if (has_disco_key) {
-                uint32_t ep_ip = 0;
-                if (mp->endpoint_port > 0) {
+            if (has_disco_key && mp->n_endpoints > 0) {
+                uint32_t ep_ips[TSNODE_MAP_MAX_ENDPOINTS];
+                uint16_t ep_ports[TSNODE_MAP_MAX_ENDPOINTS];
+                uint8_t n_eps = 0;
+                for (uint8_t e = 0; e < mp->n_endpoints &&
+                                e < TSNODE_MAP_MAX_ENDPOINTS; e++) {
                     unsigned a, b, c, d;
-                    if (sscanf(mp->endpoint_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                        ep_ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
-                                ((uint32_t)c << 8) | (uint32_t)d;
+                    if (sscanf(mp->endpoints[e].ip, "%u.%u.%u.%u",
+                               &a, &b, &c, &d) == 4) {
+                        ep_ips[n_eps] = ((uint32_t)a << 24) |
+                                        ((uint32_t)b << 16) |
+                                        ((uint32_t)c << 8) | (uint32_t)d;
+                        ep_ports[n_eps] = mp->endpoints[e].port;
+                        n_eps++;
                     }
                 }
                 tsnode_disco_add_peer(&s_disco, mp->key, mp->disco_key,
-                                      ep_ip ? &ep_ip : NULL,
-                                      mp->endpoint_port ? &mp->endpoint_port : NULL,
-                                      ep_ip ? 1 : 0);
+                                      n_eps ? ep_ips : NULL,
+                                      n_eps ? ep_ports : NULL,
+                                      n_eps);
             }
         }
         }
 
-        /* Initiate handshake if no active session */
+        /* Initiate handshake if no active session.
+         * Use the first endpoint (prefer LAN-private when present, since
+         * the parser stores endpoints in MapResponse order and disco probes
+         * all of them independently). */
         if (!tsnode_wg_peer_has_session(&s_wg_dev, idx)) {
             uint64_t now_ms;
             tsnode_port_uptime_ms(&now_ms);
@@ -949,11 +961,11 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
             }
             TSNODE_LOGI(TAG, "WG TX initiation ready %d bytes t=%lu ms", TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
 
-            /* Parse endpoint IP for sendto */
+            /* Use first endpoint for WG initiation sendto */
             uint32_t ep_ip = 0;
             {
                 unsigned a, b, c, d;
-                if (sscanf(mp->endpoint_ip, "%u.%u.%u.%u",
+                if (sscanf(mp->endpoints[0].ip, "%u.%u.%u.%u",
                            &a, &b, &c, &d) == 4) {
                     ep_ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
                             ((uint32_t)c << 8) | (uint32_t)d;
@@ -962,16 +974,16 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
 
             err = tsnode_port_udp_sendto(s_wg_sock, initiation,
                                           sizeof(initiation),
-                                          ep_ip, mp->endpoint_port);
+                                          ep_ip, mp->endpoints[0].port);
             if (err != TSNODE_OK) {
                 TSNODE_LOGW(TAG, "WG TX initiation FAILED: %d peer=%d dst=%s:%u t=%lu ms",
-                            err, idx, mp->endpoint_ip, mp->endpoint_port,
+                            err, idx, mp->endpoints[0].ip, mp->endpoints[0].port,
                             (unsigned long)ts_rel_ms());
             } else {
                 s_wg_counters.tx_initiation++;
                 TSNODE_LOGI(TAG, "WG TX init #%lu -> %s:%u len=%d t=%lu ms",
                             (unsigned long)s_wg_counters.tx_initiation,
-                            mp->endpoint_ip, mp->endpoint_port,
+                            mp->endpoints[0].ip, mp->endpoints[0].port,
                             TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
             }
         }
@@ -1083,7 +1095,9 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
                 if (p->disco_key[k] != 0) { has_dk = true; break; }
             }
             TSNODE_LOGI(TAG, "peer[%d]: ip=%s ep=%s:%u disco=%s",
-                        i, p->tailscale_ip, p->endpoint_ip, p->endpoint_port,
+                        i, p->tailscale_ip,
+                        p->n_endpoints > 0 ? p->endpoints[0].ip : "-",
+                        p->n_endpoints > 0 ? p->endpoints[0].port : 0,
                         has_dk ? "yes" : "no");
         }
     }

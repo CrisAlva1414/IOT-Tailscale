@@ -763,25 +763,26 @@ static void test_map_parse_self_addrs(void)
         "\"ID\":12345,"
         "\"PublicKey\":\"nodekey:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233\","
         "\"HostInfo\":{\"OS\":\"linux\",\"Hostname\":\"esp32-test\"},"
-        "\"Addrs\":[\"100.67.12.69/32\"]"
+        "\"Addrs\":[\"100.64.0.10/32\"]"
         "},"
         "\"Peers\":["
         "{"
         "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
         "\"HostInfo\":{\"Hostname\":\"nas\"},"
-        "\"AllowedIPs\":[\"100.75.129.85/32\"],"
-        "\"Endpoints\":[\"192.168.1.100:51820\"]"
+        "\"AllowedIPs\":[\"100.64.0.20/32\"],"
+        "\"Endpoints\":[\"192.0.2.100:51820\"]"
         "}"
         "]}";
 
     tsnode_map_netmap_t netmap;
     tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
     CHECK(err == TSNODE_OK);
-    CHECK(strcmp(netmap.self_ip, "100.67.12.69") == 0);
+    CHECK(strcmp(netmap.self_ip, "100.64.0.10") == 0);
     CHECK(netmap.peer_count == 1);
-    CHECK(strcmp(netmap.peers[0].tailscale_ip, "100.75.129.85") == 0);
-    CHECK(strcmp(netmap.peers[0].endpoint_ip, "192.168.1.100") == 0);
-    CHECK(netmap.peers[0].endpoint_port == 51820);
+    CHECK(strcmp(netmap.peers[0].tailscale_ip, "100.64.0.20") == 0);
+    CHECK(netmap.peers[0].n_endpoints == 1);
+    CHECK(strcmp(netmap.peers[0].endpoints[0].ip, "192.0.2.100") == 0);
+    CHECK(netmap.peers[0].endpoints[0].port == 51820);
 }
 
 static void test_map_parse_no_self_addrs(void)
@@ -795,7 +796,7 @@ static void test_map_parse_no_self_addrs(void)
         "\"Peers\":["
         "{"
         "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
-        "\"AllowedIPs\":[\"100.75.129.85/32\"]"
+        "\"AllowedIPs\":[\"100.64.0.20/32\"]"
         "}"
         "]}";
 
@@ -803,13 +804,13 @@ static void test_map_parse_no_self_addrs(void)
     tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
     CHECK(err == TSNODE_OK);
     /* Fallback: first "100." found in AllowedIPs */
-    CHECK(strcmp(netmap.self_ip, "100.75.129.85") == 0);
+    CHECK(strcmp(netmap.self_ip, "100.64.0.20") == 0);
     CHECK(netmap.peer_count == 1);
 }
 
 static void test_map_parse_peer_endpoint_multi(void)
 {
-    /* Peer with multiple endpoints (only first is used) */
+    /* Peer with multiple endpoints — all should be parsed (not just first) */
     const char *json =
         "{\"Self\":{"
         "\"Addrs\":[\"100.64.0.1/32\"]"
@@ -818,15 +819,63 @@ static void test_map_parse_peer_endpoint_multi(void)
         "{"
         "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
         "\"AllowedIPs\":[\"100.64.0.2/32\"],"
-        "\"Endpoints\":[\"10.0.0.1:51820\",\"10.0.0.2:51821\"]"
+        "\"Endpoints\":[\"192.0.2.100:41641\",\"203.0.113.5:41641\"]"
         "}"
         "]}";
 
     tsnode_map_netmap_t netmap;
     tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
     CHECK(err == TSNODE_OK);
-    CHECK(strcmp(netmap.peers[0].endpoint_ip, "10.0.0.1") == 0);
-    CHECK(netmap.peers[0].endpoint_port == 51820);
+    CHECK(netmap.peers[0].n_endpoints == 2);
+    CHECK(strcmp(netmap.peers[0].endpoints[0].ip, "192.0.2.100") == 0);
+    CHECK(netmap.peers[0].endpoints[0].port == 41641);
+    CHECK(strcmp(netmap.peers[0].endpoints[1].ip, "203.0.113.5") == 0);
+    CHECK(netmap.peers[0].endpoints[1].port == 41641);
+}
+
+static void test_map_parse_peer_endpoint_cap(void)
+{
+    /* Peer with more endpoints than MAX — should cap at TSNODE_MAP_MAX_ENDPOINTS */
+    const char *json =
+        "{\"Self\":{"
+        "\"Addrs\":[\"100.64.0.1/32\"]"
+        "},"
+        "\"Peers\":["
+        "{"
+        "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
+        "\"AllowedIPs\":[\"100.64.0.2/32\"],"
+        "\"Endpoints\":[\"10.0.0.1:1\",\"10.0.0.2:2\",\"10.0.0.3:3\","
+        "\"10.0.0.4:4\",\"10.0.0.5:5\"]"
+        "}"
+        "]}";
+
+    tsnode_map_netmap_t netmap;
+    tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
+    CHECK(err == TSNODE_OK);
+    CHECK(netmap.peers[0].n_endpoints == TSNODE_MAP_MAX_ENDPOINTS);
+    CHECK(strcmp(netmap.peers[0].endpoints[3].ip, "10.0.0.4") == 0);
+    CHECK(netmap.peers[0].endpoints[3].port == 4);
+}
+
+static void test_map_parse_peer_no_endpoints(void)
+{
+    /* Peer without endpoints — n_endpoints should be 0 (unreachable) */
+    const char *json =
+        "{\"Self\":{"
+        "\"Addrs\":[\"100.64.0.1/32\"]"
+        "},"
+        "\"Peers\":["
+        "{"
+        "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
+        "\"AllowedIPs\":[\"100.64.0.2/32\"]"
+        "}"
+        "]}";
+
+    tsnode_map_netmap_t netmap;
+    tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
+    CHECK(err == TSNODE_OK);
+    CHECK(netmap.peers[0].n_endpoints == 0);
+    CHECK(netmap.peers[0].online == false);
 }
 
 int main(void)
@@ -853,6 +902,8 @@ int main(void)
     RUN(test_map_parse_self_addrs);
     RUN(test_map_parse_no_self_addrs);
     RUN(test_map_parse_peer_endpoint_multi);
+    RUN(test_map_parse_peer_endpoint_cap);
+    RUN(test_map_parse_peer_no_endpoints);
 
     printf("%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed == 0 ? 0 : 1;
