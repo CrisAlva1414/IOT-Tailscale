@@ -31,6 +31,12 @@ tsnode_port_log_fn tsnode_port_get_log(void)
 }
 
 /* Default log implementation using ESP-IDF esp_log */
+/* Tamaño del buffer de formato del mensaje. Debe cubrir la línea más larga
+ * que el core pueda emitir: los dumps REG/JSON usan chunks de hasta 200 B
+ * más prefijo (~10-40 B). 512 B deja margen holgado sin truncar (GOAL-4).
+ * No se usa heap: buffer estático con techo en compile-time (AGENTS.md §4). */
+#define TSNODE_DEFAULT_LOG_BUF 512u
+
 static void default_log(int level, const char *tag, const char *fmt, ...)
 {
     va_list args;
@@ -42,9 +48,16 @@ static void default_log(int level, const char *tag, const char *fmt, ...)
     case 2:  esp_level = ESP_LOG_INFO;    break;
     default: esp_level = ESP_LOG_DEBUG;   break;
     }
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, args);
+    char buf[TSNODE_DEFAULT_LOG_BUF];
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    /* Truncación nunca silenciosa (AGENTS.md §4): si el mensaje no cabía
+     * en el buffer se avisa, para que un formato que crezca no pase
+     * desapercibido (GOAL-4). */
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        esp_log_write(ESP_LOG_WARN, tag, "[tsnode] log truncated (%d>%u)",
+                      n, (unsigned)sizeof(buf));
+    }
     /* Use esp_log_write with level and tag only — no timestamp format
      * since ESP-IDF handles that internally. */
     esp_log_write(esp_level, tag, "%s", buf);

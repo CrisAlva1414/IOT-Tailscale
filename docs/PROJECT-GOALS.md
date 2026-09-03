@@ -33,10 +33,12 @@ pública en MapRequest.
 **Archivos clave**: `components/tsnode/src/proto/tsnode_client.c`, `components/tsnode/src/disco/disco.{c,h}`
 
 ### GOAL-4: Logging perfecto
-**Estado**: PENDING
+**Estado**: COMPLETED (logging hardened; validación visual en hardware pendiente)
 **Criterio de éxito**: Sin truncamiento de strings, sin caracteres raros en serial output, timestamps correctos.
-**Problema actual**: No hay problemas reportados, pero necesita validación exhaustiva.
-**Archivos clave**: `main/main.c`, cualquier archivo con `ESP_LOG*`
+**Estado técnico**: Buffer de `default_log()` subido de 256→512 B con detección de truncación no silenciosa
+(aviso WARN si un mensaje excede el buffer). Timestamps correctos (ESP-IDF `esp_log_write`). Console filtra
+no-imprimibles. Build PASS, tests PASS, cppcheck limpio.
+**Archivos clave**: `components/tsnode/src/port/esp_idf/tsnode_port_esp_idf.c`
 
 ### GOAL-5: Ping end-to-end
 **Estado**: BLOCKED (depende de GOAL-1, 2, 3)
