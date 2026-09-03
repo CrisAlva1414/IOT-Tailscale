@@ -91,6 +91,20 @@ tsnode_err_t h2_post(h2_conn_t *h, const char *authority, const char *path,
                      const char *lb_value, const uint8_t *body, size_t body_len,
                      uint8_t *resp, size_t resp_cap, size_t *resp_len);
 
+/*
+ * Envía un PING keepalive (frame PING, stream 0) y espera el ACK del par
+ * con el mismo payload opaco de 8 bytes. Retorna TSNODE_OK al recibir el
+ * ACK; en cualquier otro frame/error se propaga el error de la capa
+ * inferior (NETWORK por EOF/GOAWAY/fallo de escritura, TIMEOUT si el par
+ * no responde dentro del timeout de la capa de registros).
+ *
+ * Propósito (ADR-0009): mantener viva la conexión HTTP/2/Noise/TCP contra
+ * el control plane entre polls de map. El PING viaja como frame h2 dentro
+ * del túnel cifrado y refresca el mapping NAT/firewall que de otro modo
+ * derriba la conexión tras ~90s de idle (GOAL-6).
+ */
+tsnode_err_t h2_ping(h2_conn_t *h);
+
 /* Solo para tests: codifica el bloque HPACK del request. Orden fijo:
  * :method POST, :scheme https, :authority, :path, [ts-lb], content-type.
  * Vector de referencia generado contra producción (sesión 2026-08-23). */

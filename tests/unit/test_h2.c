@@ -464,6 +464,136 @@ static void test_ping_gets_pong(void)
     CHECK(found_pong);
 }
 
+/* Payload opaco del PING keepalive que envía h2_ping (h2.c). */
+static const uint8_t PING_KEEPALIVE_PAYLOAD[8] =
+    { 0x74, 0x73, 0x6e, 0x6f, 0x64, 0x65, 0x50, 0x31 };
+
+static void test_h2_ping_gets_ack(void)
+{
+    /* Server responde a nuestro PING con un ACK que repite el payload. */
+    static uint8_t inbuf[128];
+    static size_t lens[4];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x6, 0x1 /* ACK */, 0, PING_KEEPALIVE_PAYLOAD, 8);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+    CHECK(h2_ping(&h) == TSNODE_OK);
+
+    /* Verificar que se envió un frame PING (type 0x6, sin ACK, stream 0) con
+     * el payload del keepalive. */
+    int found_ping = 0;
+    for (size_t i = 0; i + 17 <= m.out_len; i++) {
+        if (m.out[i] == 0x00 && m.out[i + 1] == 0x00 && m.out[i + 2] == 0x08 &&
+            m.out[i + 3] == 0x06 && m.out[i + 4] == 0x00 &&
+            m.out[i + 5] == 0x00 && m.out[i + 6] == 0x00 &&
+            memcmp(m.out + i + 9, PING_KEEPALIVE_PAYLOAD, 8) == 0) {
+            found_ping = 1;
+            break;
+        }
+    }
+    CHECK(found_ping);
+}
+
+static void test_h2_ping_server_ping_ponged(void)
+{
+    /* El servidor manda su propio PING (sin ACK) antes de ackear el nuestro:
+     * el cliente debe responder PONG primero, luego ver el ACK y retornar OK. */
+    static uint8_t inbuf[128];
+    static size_t lens[4];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    uint8_t srv_ping[8] = {0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44};
+    flen = mk_frame(f, 0x6, 0x0, 0, srv_ping, 8);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x6, 0x1 /* ACK */, 0, PING_KEEPALIVE_PAYLOAD, 8);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+    CHECK(h2_ping(&h) == TSNODE_OK);
+
+    /* Debe haber salido un PONG (ACK) con el payload del PING del server. */
+    int found_pong = 0;
+    for (size_t i = 0; i + 17 <= m.out_len; i++) {
+        if (m.out[i] == 0x00 && m.out[i + 1] == 0x00 && m.out[i + 2] == 0x08 &&
+            m.out[i + 3] == 0x06 && m.out[i + 4] == 0x01 &&
+            memcmp(m.out + i + 9, srv_ping, 8) == 0) {
+            found_pong = 1;
+            break;
+        }
+    }
+    CHECK(found_pong);
+}
+
+static void test_h2_ping_eof_fails(void)
+{
+    /* Solo el SETTINGS, sin ACK: el EOF durante h2_ping debe propagarse
+     * como NETWORK, nunca colgarse. */
+    static uint8_t inbuf[64];
+    static size_t lens[2];
+    uint8_t f[64];
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf, f, flen);
+    lens[0] = flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = 1;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+    CHECK(h2_ping(&h) == TSNODE_ERR_NETWORK);
+}
+
+static void test_h2_ping_unstarted_fails(void)
+{
+    h2_conn_t h;
+    memset(&h, 0, sizeof(h));
+    CHECK(h2_ping(&h) == TSNODE_ERR_INVALID_ARG);
+}
+
 static void test_unknown_frame_type_fails_closed(void)
 {
     static uint8_t inbuf[256];
@@ -710,6 +840,10 @@ int main(void)
     RUN(test_oversize_frame_rejected);
     RUN(test_non_200_status_rejected);
     RUN(test_ping_gets_pong);
+    RUN(test_h2_ping_gets_ack);
+    RUN(test_h2_ping_server_ping_ponged);
+    RUN(test_h2_ping_eof_fails);
+    RUN(test_h2_ping_unstarted_fails);
     RUN(test_unknown_frame_type_fails_closed);
     RUN(test_response_overflow_fails);
     RUN(test_eof_mid_stream_fails);

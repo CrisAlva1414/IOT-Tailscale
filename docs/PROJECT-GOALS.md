@@ -49,10 +49,16 @@ por el túnel WG. Tests unitarios + build PASS, cppcheck limpio (ADR-0016). Pend
 **Archivos clave**: `components/tsnode/src/wg/icmp_echo.{c,h}`, `components/tsnode/src/proto/tsnode_client.c`, `docs/adr/0016-icmp-echo-responder.md`
 
 ### GOAL-6: Conexión estable (99.9% uptime)
-**Estado**: PARTIAL
+**Estado**: PARTIAL (keepalive H2 PING implementado; pendiente validación en hardware)
 **Criterio de éxito**: El dispositivo permanece conectado mientras esté encendido (USB). Reconnect < 10s.
-**Problema actual**: Cicla cada ~90s (90s on / 5s reconnect). Mejoró pero no es estable.
-**Archivos clave**: `components/tsnode/src/control.c` (reconnect loop)
+**Problema actual**: Ciclaba cada ~90s (90s on / 5s reconnect). Causal hipotetizada: NAT/firewall
+derriba la conexión del control plane tras ~90s de idle entre polls de map.
+**Estado técnico**: Añadido `h2_ping()` (ADR-0009 D1: PING sobre túnel H2/Noise) y un keepalive en el
+poll loop de `tsnode_client.c` que envía un PING HTTP/2 cada `H2_PING_IDLE_S=20s` de idle para refrescar
+el mapping NAT. Un keepalive fallido entra en el backoff de reconexión existente. Tests host
+(test_h2.c, 4 casos nuevos), build PASS (-Werror), cppcheck limpio (solo finding pre-existente no
+relacionado). Pendiente: validar en hardware que el nodo se mantiene online > 1h sin ciclo de 90s.
+**Archivos clave**: `components/tsnode/src/proto/h2.{c,h}` (h2_ping), `components/tsnode/src/proto/tsnode_client.c` (keepalive poll loop), `tests/unit/test_h2.c`
 
 ### GOAL-7: Flash encryption en Release mode
 **Estado**: DEFERRED

@@ -467,3 +467,69 @@ tsnode_err_t h2_post(h2_conn_t *h, const char *authority, const char *path,
     *resp_len = rc.resp_len;
     return TSNODE_OK;
 }
+
+tsnode_err_t h2_ping(h2_conn_t *h)
+{
+    if (h == NULL || !h->started) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+
+    /* Payload opaco de 8 bytes (RFC 7540 §6.7). No es criptográfico: sirve
+     * para reconocer el ACK de *nuestro* PING, ya que el par lo repite tal
+     * cual en la respuesta con ACK. Mantenerlo fijo por instancia de h2. */
+    const uint8_t payload[8] = { 0x74, 0x73, 0x6e, 0x6f, 0x64, 0x65, 0x50, 0x31 };
+
+    uint8_t hdr[H2_HEADER_LEN];
+    put_frame_header(hdr, H2_FRAME_PING, 0, 0, 8);
+    tsnode_err_t err = send_all(&h->io, hdr, sizeof(hdr));
+    if (err != TSNODE_OK) return err;
+    err = send_all(&h->io, payload, sizeof(payload));
+    if (err != TSNODE_OK) return err;
+
+    /* Esperar el ACK del par. Los timeouts llegan de la capa de registros
+     * (SO_RCVTIMEO del port): no bloquea más que una lectura normal. */
+    for (;;) {
+        h2_frame_view_t f;
+        err = peek_frame(h, &f);
+        if (err != TSNODE_OK) return err;
+
+        if (f.type == H2_FRAME_PING) {
+            if (f.length != 8 || f.stream_id != 0) {
+                return TSNODE_ERR_NETWORK;
+            }
+            if (f.flags & H2_FLAG_ACK) {
+                /* ACK a nuestro PING (payload repetido): éxito. Un ACK con
+                 * payload distinto es un peer malformado; lo descartamos y
+                 * seguimos esperando el nuestro (sin daño ni riesgo). */
+                if (memcmp(f.payload, payload, 8) == 0) {
+                    consume_frame(h, &f);
+                    return TSNODE_OK;
+                }
+                consume_frame(h, &f);
+                continue;
+            }
+            /* Un PING del par (sin ACK): respondemos PONG como manda el spec
+             * (RFC 7540 §6.7) y seguimos esperando nuestro ACK. */
+            err = send_pong(h, f.payload, f.length);
+            consume_frame(h, &f);
+            if (err != TSNODE_OK) return err;
+            continue;
+        }
+
+        /* Frames de control inofensivos durante el keepalive. */
+        if (f.type == H2_FRAME_SETTINGS) {
+            err = handle_frame(h, &f, NULL);
+            consume_frame(h, &f);
+            if (err != TSNODE_OK) return err;
+            continue;
+        }
+        if (f.type == H2_FRAME_WINDOW_UPDATE || f.type == H2_FRAME_PRIORITY) {
+            consume_frame(h, &f);
+            continue;
+        }
+
+        /* GOAWAY, DATA fuera de stream, CONTINUATION o frames desconocidos:
+         * sin recovery en este subset, fail-closed (ADR-0009 D1/D3). */
+        return TSNODE_ERR_NETWORK;
+    }
+}

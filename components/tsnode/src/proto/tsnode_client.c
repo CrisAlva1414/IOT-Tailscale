@@ -808,6 +808,12 @@ static tsnode_err_t do_connect(void)
 #define MAP_POLL_INTERVAL_MAX_S   300
 #define MAP_POLL_JITTER_PCT       20  /* ±20% jitter */
 
+/* Cada cuántos segundos de idle en el túnel HTTP/2/Noise/TCP se envía un
+ * PING keepalive (h2_ping) para que NAT/firewall no derriben la conexión
+ * entre polls de map (GOAL-6, ADR-0009 D1). Debe ser sensiblemente menor
+ * que el idle al que el control plane muere (~90s observado en hardware). */
+#define H2_PING_IDLE_S  20
+
 /* WireGuard device and UDP socket for data plane (ADR-0011) */
 static tsnode_wg_device_t s_wg_dev;
 static tsnode_port_udp_socket_t *s_wg_sock;
@@ -1376,13 +1382,50 @@ static void client_task(void *arg)
                     sleep_s -= (tick % jitter);
                 }
             }
-            /* Sleep in 1-second chunks so tsnode_client_stop() is responsive */
+            /* Sleep in 1-second chunks so tsnode_client_stop() is responsive.
+             * Cada H2_PING_IDLE_S de idle se envía un PING HTTP/2 por el
+             * túnel para refrescar el mapping NAT/firewall del control plane
+             * (GOAL-6): sin tráfico, la conexión muere a ~90s y el nodo
+             * cicla 90s online / 5s reconectando. */
+            bool keepalive_failed = false;
+            uint32_t idle_s = 0;
             for (uint32_t i = 0; i < sleep_s; i++) {
                 if (s_state != TSNODE_CLIENT_ONLINE) break;
                 tsnode_port_delay_ms(1000);
+                idle_s++;
+                if (idle_s >= H2_PING_IDLE_S) {
+                    idle_s = 0;
+                    tsnode_err_t perr = h2_ping(&s_h2);
+                    if (perr != TSNODE_OK) {
+                        TSNODE_LOGW(TAG, "h2 keepalive ping failed: %d — "
+                                    "dropping for reconnect", perr);
+                        keepalive_failed = true;
+                        break;
+                    }
+                }
             }
 
             if (s_state != TSNODE_CLIENT_ONLINE) break;
+
+            /* Keepalive fallido: el túnel no responde → reconexión. Se cuenta
+             * como error de poll para que entre en el backoff existente. */
+            if (keepalive_failed) {
+                poll_consecutive_errors++;
+                poll_interval_s = MAP_POLL_INTERVAL_BASE_S *
+                                  (1 << (poll_consecutive_errors < 5 ? poll_consecutive_errors : 5));
+                if (poll_interval_s > MAP_POLL_INTERVAL_MAX_S) {
+                    poll_interval_s = MAP_POLL_INTERVAL_MAX_S;
+                }
+                TSNODE_LOGW(TAG, "map poll error (keepalive), backoff to %us",
+                            poll_interval_s);
+
+                if (poll_consecutive_errors >= 3) {
+                    TSNODE_LOGE(TAG, "too many map poll errors — "
+                                "dropping connection for reconnect");
+                    break;  /* exit poll loop → outer loop reconnects */
+                }
+                continue;
+            }
 
             tsnode_map_netmap_t netmap;
             tsnode_err_t poll_err = do_map_poll(&netmap);

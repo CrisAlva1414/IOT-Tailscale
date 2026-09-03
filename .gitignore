@@ -28,6 +28,9 @@ coredump*
 tests/unit/test_h2
 tests/unit/test_blake2s
 tests/unit/test_wg
+tests/unit/test_replay
+tests/unit/test_nacl_box
+tests/unit/test_icmp_echo
 tests/interop/wg_interop
 
 # Sistema
