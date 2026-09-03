@@ -8,7 +8,7 @@ CRYPTO = $(TSNODE)/src/crypto
 WG = $(TSNODE)/src/wg
 VECTORS = protocol_vectors
 
-TESTS = test_h2 test_blake2s test_replay test_wg test_nacl_box
+TESTS = test_h2 test_blake2s test_replay test_wg test_nacl_box test_icmp_echo
 
 all: $(TESTS)
 
@@ -65,12 +65,16 @@ test_nacl_box: test_nacl_box.c $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
 		../../third_party/salsa20poly1305/poly1305.c \
 		$(VENDORTW)
 
+test_icmp_echo: test_icmp_echo.c $(WG)/icmp_echo.c $(WG)/icmp_echo.h
+	$(CC) $(CFLAGS) -I$(WG) -o $@ test_icmp_echo.c $(WG)/icmp_echo.c
+
 check: all
 	./test_h2
 	./test_blake2s
 	./test_replay
 	./test_wg
 	./test_nacl_box
+	./test_icmp_echo
 
 clean:
 	rm -f $(TESTS)

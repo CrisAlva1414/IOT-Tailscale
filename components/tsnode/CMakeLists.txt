@@ -16,6 +16,7 @@ idf_component_register(
          "${PROJECT_DIR}/third_party/salsa20poly1305/poly1305.c"
          "src/wg/wg.c"
          "src/wg/replay.c"
+         "src/wg/icmp_echo.c"
          "src/wg/wg_crypto_mbedtls.c"
          "src/disco/disco.c"
          "src/proto/ts2021.c"

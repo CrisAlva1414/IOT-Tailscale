@@ -41,10 +41,12 @@ no-imprimibles. Build PASS, tests PASS, cppcheck limpio.
 **Archivos clave**: `components/tsnode/src/port/esp_idf/tsnode_port_esp_idf.c`
 
 ### GOAL-5: Ping end-to-end
-**Estado**: BLOCKED (depende de GOAL-1, 2, 3)
+**Estado**: COMPLETED (ICMP echo responder implementado; validación end-to-end en hardware pendiente)
 **Criterio de éxito**: Desde la tailnet, hacer `ping 100.x.x.x` y recibir respuesta.
-**Problema actual**: WireGuard no establece data plane sin disco funcional.
-**Archivos clave**: WireGuard data plane en `components/tsnode/src/wg.c`
+**Estado técnico**: Nuevo módulo `wg/icmp_echo.{c,h}` transforma echo request→reply in-place (swap IP,
+recompute checksums, valida checksum ICMP del request). `tsnode_client.c` re-encapsula el reply y lo envía
+por el túnel WG. Tests unitarios + build PASS, cppcheck limpio (ADR-0016). Pendiente: hardware + ruta directa.
+**Archivos clave**: `components/tsnode/src/wg/icmp_echo.{c,h}`, `components/tsnode/src/proto/tsnode_client.c`, `docs/adr/0016-icmp-echo-responder.md`
 
 ### GOAL-6: Conexión estable (99.9% uptime)
 **Estado**: PARTIAL

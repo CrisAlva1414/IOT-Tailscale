@@ -20,6 +20,7 @@
 #include "base64.h"
 #include "wg.h"
 #include "disco.h"
+#include "icmp_echo.h"
 
 /* Port layer provides all platform abstractions (ADR-0006) */
 
@@ -1217,11 +1218,39 @@ static void wg_recv_task(void *arg)
                             (unsigned long)s_wg_counters.rx_keepalive,
                             peer_idx, (unsigned long)ts_rel_ms());
             } else {
-                /* Inner IP packet — for v1, log and drop (no TUN) */
                 s_wg_counters.rx_transport++;
-                TSNODE_LOGI(TAG, "WG RX data #%lu peer=%d %zu bytes (no TUN) t=%lu ms",
-                            (unsigned long)s_wg_counters.rx_transport,
-                            peer_idx, inner_len, (unsigned long)ts_rel_ms());
+                /* PING end-to-end (GOAL-5): responder ICMP echo request
+                 * dentro del túnel autenticado. El transform es in-place y
+                 * devuelve el echo reply listo para encapsular. Si no es un
+                 * echo request (o su checksum es inválido), se deja intacto
+                 * y se descarta (v1 no tiene TUN). */
+                if (tsnode_icmp4_make_echo_reply(inner_buf, inner_len)) {
+                    uint8_t reply[TSNODE_WG_INNER_MAX + TSNODE_WG_TRANSPORT_OVERHEAD];
+                    size_t reply_len = 0;
+                    uint64_t now_ms;
+                    tsnode_port_uptime_ms(&now_ms);
+                    err = tsnode_wg_encap(&s_wg_dev, peer_idx, inner_buf,
+                                          inner_len, now_ms,
+                                          reply, sizeof(reply), &reply_len);
+                    if (err != TSNODE_OK) {
+                        TSNODE_LOGW(TAG, "WG ICMP reply encap failed: %d", err);
+                    } else {
+                        err = tsnode_port_udp_sendto(s_wg_sock, reply, reply_len,
+                                                     src_ip, src_port);
+                        if (err != TSNODE_OK) {
+                            TSNODE_LOGW(TAG, "WG ICMP reply send failed: %d", err);
+                        } else {
+                            TSNODE_LOGI(TAG, "WG ICMP echo reply #%lu peer=%d %zu bytes t=%lu ms",
+                                        (unsigned long)s_wg_counters.rx_transport,
+                                        peer_idx, inner_len, (unsigned long)ts_rel_ms());
+                        }
+                    }
+                } else {
+                    /* Inner non-ICMP echo packet — log and drop (no TUN) */
+                    TSNODE_LOGI(TAG, "WG RX data #%lu peer=%d %zu bytes (no TUN) t=%lu ms",
+                                (unsigned long)s_wg_counters.rx_transport,
+                                peer_idx, inner_len, (unsigned long)ts_rel_ms());
+                }
             }
             break;
         }
