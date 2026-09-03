@@ -23,7 +23,7 @@ Sesión de testing en hardware (M5Stack Core 2) para verificar:
 ## Testing en hardware (M5Stack Core 2)
 
 ### Setup
-- WiFi: <ssid> (IP 192.168.1.104)
+- WiFi: <ssid> (IP <ip-lan>)
 - Auth key: temporal, consumida y borrada después de testing
 - Firmware: commit b057b94
 
@@ -31,12 +31,12 @@ Sesión de testing en hardware (M5Stack Core 2) para verificar:
 
 | Paso | Estado | Detalle |
 |------|--------|---------|
-| WiFi connect | ✅ | IP 192.168.1.104 |
+| WiFi connect | ✅ | IP <ip-lan> |
 | fetch_control_key | ✅ | controlplane.tailscale.com |
 | Noise handshake | ✅ | IK pattern OK |
 | HTTP/2 over Noise | ✅ | Tunnel establecido |
 | Register | ✅ | `MachineAuthorized: true` |
-| MapResponse parse | ✅ | `self=100.118.151.41` |
+| MapResponse parse | ✅ | `self=<ip-tailnet>` |
 | Peers parsed | ✅ | 4 peers con IPs y endpoints |
 | WG device init | ✅ | WireGuard device inicializado |
 | WG peer add | ✅ | 4 peers agregados |
@@ -45,8 +45,8 @@ Sesión de testing en hardware (M5Stack Core 2) para verificar:
 
 ### Hallazgos clave
 
-1. **Self.Addrs fix funciona**: El nodo ahora extrae correctamente su IP `100.118.151.41` del campo `Self.Addrs` del MapResponse
-2. **4 peers parseados**: notebook (100.105.81.72), redmi (100.84.209.106), orangepi (100.75.129.85), pc01 (100.106.211.85)
+1. **Self.Addrs fix funciona**: El nodo ahora extrae correctamente su IP `<ip-tailnet>` del campo `Self.Addrs` del MapResponse
+2. **4 peers parseados**: notebook, redmi, orangepi, pc01 (IPs omitidas por privacidad)
 3. **WG initiations enviados**: A los 4 peers con sus endpoints UDP correctos
 4. **Auth key consumida y borrada**: NVS limpio después de testing
 
@@ -75,4 +75,4 @@ Los WG initiations se enviaron pero no se recibieron responses porque:
 
 **Bloqueador #1**: El ESP32 está detrás de NAT. Sin disco protocol, los peers no pueden responder al WG initiation. El usuario tiene la solución — pendiente de implementar.
 
-**Estado del nodo en Tailscale**: Registrado, autorizado, IP `100.118.151.41` asignada, pero **inalcanzable** (no completa WG handshake).
+**Estado del nodo en Tailscale**: Registrado, autorizado, IP `<ip-tailnet>` asignada, pero **inalcanzable** (no completa WG handshake).

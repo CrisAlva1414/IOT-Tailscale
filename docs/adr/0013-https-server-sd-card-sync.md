@@ -5,7 +5,7 @@
 
 ## Contexto
 
-El ESP32 está registrado en la tailnet con IP 100.118.151.41 y tiene WireGuard data plane funcional (handshake + transport). Falta hacerlo **alcanzable** para que otros nodos puedan enviarle consultas.
+El ESP32 está registrado en la tailnet con IP `<ip-tailnet>` y tiene WireGuard data plane funcional (handshake + transport). Falta hacerlo **alcanzable** para que otros nodos puedan enviarle consultas.
 
 Caso de uso del usuario:
 - El ESP32 almacena datos en una **SD card** (sensores, logs, archivos)

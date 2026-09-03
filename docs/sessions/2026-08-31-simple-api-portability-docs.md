@@ -53,7 +53,7 @@ Items dejados para futuras sesiones:
 ### Hallazgo clave: MapResponse Addresses null
 
 El MapResponse del control plane devuelve `"Addresses":null` aunque el nodo
-está aprobado con IP 100.67.12.69 asignada en la consola de Tailscale.
+está aprobado con IP `<ip-tailnet>` asignada en la consola de Tailscale.
 Esto sugiere que:
 1. El nodo necesita ser "activated" (no solo "approved")
 2. O hay un mismatch entre el estado del nodo y lo que el control plane devuelve

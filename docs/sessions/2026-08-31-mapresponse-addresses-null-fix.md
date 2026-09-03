@@ -44,22 +44,22 @@ Se hizo un análisis cruzado entre:
 
 - El endpoint UDP se envía en el MapRequest dentro del tunnel Noise (no en claro)
 - Puerto WG fijo: 51820 (estándar WireGuard)
-- IP del endpoint es la LAN IP del dispositivo (192.168.1.104) — en producción sería pública
+- IP del endpoint es la LAN IP del dispositivo (`<ip-lan>`) — en producción sería pública
 
 ## Verificación
 
 - Build ESP-IDF: **PASS**
 - Tests host: **100% PASS** (H2, blake2s, replay, wg)
-- MapResponse: **18,420 bytes** con **1 peer** (NAS: 100.75.129.85)
+- MapResponse: **18,420 bytes** con **1 peer** (NAS: `<ip-tailnet>`)
 - State: **ONLINE**
 
 ## Pendiente / bloqueado
 
 - **Parser self IP**: el `100.x.x.x` del nodo propio no se extrae correctamente
-- **Parser peer endpoints**: ✅ FIXED — ahora muestra `201.188.181.63:44004`
+- **Parser peer endpoints**: ✅ FIXED — ahora muestra `<ip-public>:<port>`
 - **WG initiation**: ✅ FIXED — ahora funciona con `cr->keygen()` (Curve25519 clamping via `mbedtls_ecp_gen_keypair`)
 - **Noise handshake**: ✅ FULLY WORKING — todos los pasos OK
-- **WG initiation sent**: ✅ `148 bytes → 201.188.181.63:44004`
+- **WG initiation sent**: ✅ `148 bytes → <ip-public>:<port>`
 - **Map polling**: falla después de la primera respuesta (auth key consumida)
 - **WG response + session**: pendiente — necesita auth key válida y peers online
 - **ts2021.c refactor**: deferred

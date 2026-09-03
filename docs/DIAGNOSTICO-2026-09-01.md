@@ -15,7 +15,7 @@ El objetivo es conectar un ESP32 a una tailnet de Tailscale y que sea **alcanzab
 | Componente | Estado | Detalle |
 |------------|--------|---------|
 | Control plane | ✅ FULLY WORKING | Noise handshake, HTTP/2, Register, MapResponse |
-| Self IP extraction | ✅ FIXED | `100.118.151.41` extraído de `Self.Addrs` |
+| Self IP extraction | ✅ FIXED | `<ip-tailnet>` extraído de `Self.Addrs` |
 | Peer parsing | ✅ WORKING | 4 peers parseados con endpoints |
 | WireGuard core | ✅ TESTED | Handshake, transport, replay — todos los tests pasan |
 | WG data plane | ⚠️ PARTIAL | Initiations enviadas, **sin responses** |
@@ -28,7 +28,7 @@ El objetivo es conectar un ESP32 a una tailnet de Tailscale y que sea **alcanzab
 
 El ESP32 envía WG initiations a los peers pero los peers **nunca responden**.
 
-**Causa raíz**: El ESP32 está detrás de NAT (192.168.1.104). Los peers no conocen su endpoint real. Sin **disco protocol** de Tailscale, no hay NAT traversal.
+**Causa raíz**: El ESP32 está detrás de NAT (`<ip-lan>`). Los peers no conocen su endpoint real. Sin **disco protocol** de Tailscale, no hay NAT traversal.
 
 **Sin esto, el ESP32 es un nodo "fantasma" en la tailnet**: registrado, con IP, pero inalcanzable.
 
@@ -64,8 +64,8 @@ Configs creadas (`sdkconfig.prod`) pero nunca testeadas. Requiere build Release 
 ## Estado del nodo en Tailscale
 
 ```
-Nombre:     esp32-8219d4.manee-tilapia.ts.net
-IP:         100.118.151.41
+Nombre:     <hostname>.ts.net
+IP:         <ip-tailnet>
 Tags:       tag:iot
 Estado:     Registrado y autorizado, pero INALCANZABLE
 ```

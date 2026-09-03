@@ -3,7 +3,7 @@
 ## Contexto
 
 Sesión de debug y fix del disco protocol implementado el 2026-09-01.
-El dispositivo se registraba correctamente en la tailnet (IP 100.118.151.41),
+El dispositivo se registraba correctamente en la tailnet (IP `<ip-tailnet>`),
 pero el data plane no funcionaba porque los peers no respondían a los
 WireGuard handshake initiations.
 
@@ -40,7 +40,7 @@ WireGuard handshake initiations.
 2. Disco key enviada en MapRequest (`DiscoKey: cf60dafc...`)
 3. Peers con disco key parseada desde MapResponse (4 peers, todos `disco=yes`)
 4. Disco key del ESP32 visible en MapResponse del control plane
-5. STUN Binding Request enviado a DERP server (199.38.181.93:3478)
+5. STUN Binding Request enviado a DERP server (`<ip-stun>:3478`)
 6. Disco PING enviado a los 3 peers alcanzables
 7. Polling periódico: STUN cada 30s, PING con reintentos
 
@@ -49,7 +49,7 @@ WireGuard handshake initiations.
    - Posible causa: servidor DESCPU/DERP no responde a STUN desde IPs no autorizadas
    - O: ESP32 detrás de NAT simétrico, respuesta va a puerto diferente
 2. **Disco PONG**: No se reciben PONG de ningún peer
-   - Los peers están detrás de su propio NAT (201.188.179.2, etc.)
+   - Los peers están detrás de su propio NAT (`<ip-public>`, etc.)
    - Sin hole punching simultáneo, los paquetes no llegan
 3. **WG session**: No se establece (sin disco handshake = sin ruta directa)
 
@@ -59,11 +59,11 @@ disco add: 0 peers          # peer 0 registrado
 disco add: 1 peers          # peer 1 registrado (memcmp corregido)
 disco add: 2 peers          # peer 2 registrado
 disco add: 3 peers          # peer 3 registrado
-poll: stun=199.38.181.93:3478 n_peers=4
-STUN TX -> 199.38.181.93:3478
-disco TX PING -> 201.188.179.2:1028
-disco TX PING -> 201.219.234.252:32944
-disco TX PING -> 201.188.179.2:62033
+poll: stun=<ip-stun>:3478 n_peers=4
+STUN TX -> <ip-stun>:3478
+disco TX PING -> <ip-peer-1>:<port>
+disco TX PING -> <ip-peer-2>:<port>
+disco TX PING -> <ip-peer-1>:<port2>
 # (sin respuesta)
 ```
 

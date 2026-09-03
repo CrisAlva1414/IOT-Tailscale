@@ -59,8 +59,8 @@ El alfs/tailscale-iot funciona porque usa `noise-c` (implementación X20219 prop
 
 ### ESP32 firmware
 - Noise handshake: **ALL steps OK** (random → keygen → pubkey → DH es → AEAD s → DH ss → AEAD ss)
-- WG initiation: **created OK (148 bytes)**, **sent to 201.188.181.63:44004**
-- MapResponse: full netmap with 1 peer, self IP 100.103.119.4/32
+- WG initiation: **created OK (148 bytes)**, **sent to <ip-public>:<port>**
+- MapResponse: full netmap with 1 peer, self IP <ip-tailnet>/32
 
 ## Pendiente
 

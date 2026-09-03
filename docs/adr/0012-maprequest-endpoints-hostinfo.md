@@ -31,7 +31,7 @@ Sin este campo, el control plane:
 
 ### MapRequest (`tsnode_map.c`)
 - Nuevo parámetro `endpoint_ip` + `endpoint_port` en `tsnode_map_build_request()`
-- Agrega `"Endpoints":["192.168.1.104:51820"]` al JSON del MapRequest
+- Agrega `"Endpoints":["<ip-lan>:51820"]` al JSON del MapRequest
 
 ### Hostinfo consistente (`tsnode_map.c`)
 - MapRequest ahora envía `"Hostinfo":{"OS":"linux","Hostname":"..."}`
@@ -50,7 +50,7 @@ Sin este campo, el control plane:
 | Métrica | Antes | Después |
 |---------|-------|---------|
 | MapResponse bytes | 532 | **18,420** |
-| Peers en netmap | 0 | **1** (NAS: 100.75.129.85) |
+| Peers en netmap | 0 | **1** (NAS: `<ip-tailnet>`) |
 | Self Addresses | null | *(parser pendiente)* |
 | Health warning | "node OS changed" | Eliminado |
 | State | Nunca ONLINE | **ONLINE** |
@@ -64,7 +64,7 @@ Sin este campo, el control plane:
 ## Consecuencias de seguridad
 
 - El endpoint UDP se envía en el MapRequest (no cifrado aparte del Noise tunnel)
-- El endpoint es la IP:port LAN del nodo (192.168.1.104:51820) — en producción sería la IP pública
+- El endpoint es la IP:port LAN del nodo (`<ip-lan>:51820`) — en producción sería la IP pública
 - No se exponen secrets en el MapRequest
 
 ## Pendiente
