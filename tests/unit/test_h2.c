@@ -409,6 +409,87 @@ static void test_non_200_status_rejected(void)
                   &resp_len) == TSNODE_ERR_NETWORK);
 }
 
+static void test_hpack_leading_table_size_update_ok(void)
+{
+    /* Regresión HW 2026-09-03: el encoder HPACK Go del control plane
+     * Tailscale emite un "dynamic table size update" (0x21 = size 1) ANTES
+     * del ":status 200" indexado (0x88). Nuestro parser exigía 0x88 como
+     * byte 0 del bloque y fallaba con NETWORK, rompiendo el /machine/register.
+     * Verifica que se saltee el size update y se acepte el 200. */
+    static uint8_t inbuf[256];
+    static size_t lens[8];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    /* Bloque HPACK: 0x21 (table size update = 1) + 0x88 (:status 200). */
+    uint8_t status[2] = {0x21, H2_HPACK_STATUS_200};
+    flen = mk_frame(f, 0x1, 0x5 /* END_HEADERS|END_STREAM */, 1, status, 2);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    CHECK(h2_post(&h, "controlplane.tailscale.com", "/machine/register",
+                  NULL, (const uint8_t *)"{}", 2, resp, sizeof(resp) - 1,
+                  &resp_len) == TSNODE_OK);
+}
+
+static void test_hpack_leading_table_size_update_non200_rejected(void)
+{
+    /* Mismo caso pero el status posterior NO es 200: debe seguir fallando
+     * fail-closed, no enmascarar tamaño distinto. */
+    static uint8_t inbuf[256];
+    static size_t lens[8];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    /* 0x21 size update + 0x8b (:status 500). */
+    uint8_t status[2] = {0x21, 0x8b};
+    flen = mk_frame(f, 0x1, 0x5, 1, status, 2);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    CHECK(h2_post(&h, "controlplane.tailscale.com", "/machine/register",
+                  NULL, (const uint8_t *)"{}", 2, resp, sizeof(resp) - 1,
+                  &resp_len) == TSNODE_ERR_NETWORK);
+}
+
 static void test_ping_gets_pong(void)
 {
     static uint8_t inbuf[256];
@@ -836,25 +917,114 @@ static void test_map_parse_peer_endpoint_multi(void)
 static void test_map_parse_peer_endpoint_cap(void)
 {
     /* Peer with more endpoints than MAX — should cap at TSNODE_MAP_MAX_ENDPOINTS */
-    const char *json =
-        "{\"Self\":{"
-        "\"Addrs\":[\"100.64.0.1/32\"]"
-        "},"
-        "\"Peers\":["
-        "{"
+    char json[4096];
+    /* Build an Endpoints array with MAX+2 entries */
+    int n = snprintf(json, sizeof(json),
+        "{\"Self\":{\"Addrs\":[\"100.64.0.1/32\"]},"
+        "\"Peers\":[{"
         "\"Key\":\"nodekey:1122334455667788112233445566778811223344556677881122334455667788\","
         "\"AllowedIPs\":[\"100.64.0.2/32\"],"
-        "\"Endpoints\":[\"10.0.0.1:1\",\"10.0.0.2:2\",\"10.0.0.3:3\","
-        "\"10.0.0.4:4\",\"10.0.0.5:5\"]"
+        "\"Endpoints\":[");
+    for (int i = 1; i <= TSNODE_MAP_MAX_ENDPOINTS + 2; i++) {
+        n += snprintf(json + n, sizeof(json) - (size_t)n,
+                      "\"10.0.0.%d:%d\"%s", i, i,
+                      (i <= TSNODE_MAP_MAX_ENDPOINTS + 1) ? "," : "");
+    }
+    n += snprintf(json + n, sizeof(json) - (size_t)n, "]}]}");
+
+    tsnode_map_netmap_t netmap;
+    tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
+    CHECK(err == TSNODE_OK);
+    CHECK(netmap.peers[0].n_endpoints == TSNODE_MAP_MAX_ENDPOINTS);
+    CHECK(strcmp(netmap.peers[0].endpoints[TSNODE_MAP_MAX_ENDPOINTS - 1].ip,
+                 "10.0.0.16") == 0);
+    CHECK(netmap.peers[0].endpoints[TSNODE_MAP_MAX_ENDPOINTS - 1].port == 16);
+}
+
+static void test_map_parse_multi_peer_no_desync(void)
+{
+    /* Regression HW 2026-09-03: el parser histórico desalineaba peers cuando
+     * un peer tenía Hostinfo con `{` anidado (Services/DERP), porque avanzaba
+     * con strchr('{') en lugar de anclar por nodekey. Endpoints quedaban
+     * mezclados entre peers. Este test reproduce la estructura real de
+     * Tailscale (multi-peer, Hostinfo con array) y verifica que cada peer
+     * retiene SU key/IP/endpoints sin corrimiento. */
+    const char *json =
+        "{\"Self\":{\"Addrs\":[\"100.64.0.1/32\"]},"
+        "\"Peers\":["
+        "{"
+        "\"Key\":\"nodekey:1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"AllowedIPs\":[\"100.64.0.2/32\"],"
+        "\"Endpoints\":[\"203.0.113.10:1111\"],"
+        "\"DERP\":\"127.3.3.40:11\","
+        "\"Hostinfo\":{\"OS\":\"linux\",\"Hostname\":\"notebook\","
+        "\"Services\":[{\"Proto\":\"peerapi4\",\"Port\":35850}]}"
+        "},"
+        "{"
+        "\"Key\":\"nodekey:2222222222222222222222222222222222222222222222222222222222222222\","
+        "\"AllowedIPs\":[\"100.64.0.3/32\"],"
+        "\"Endpoints\":[\"203.0.113.20:2222\"],"
+        "\"Hostinfo\":{\"OS\":\"android\",\"Hostname\":\"phone\"}"
+        "},"
+        "{"
+        "\"Key\":\"nodekey:3333333333333333333333333333333333333333333333333333333333333333\","
+        "\"AllowedIPs\":[\"100.64.0.4/32\"],"
+        "\"Endpoints\":[\"203.0.113.30:3333\",\"10.0.0.30:3333\"],"
+        "\"Hostinfo\":{\"OS\":\"linux\",\"Hostname\":\"orangepi\"}"
         "}"
         "]}";
 
     tsnode_map_netmap_t netmap;
     tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
     CHECK(err == TSNODE_OK);
-    CHECK(netmap.peers[0].n_endpoints == TSNODE_MAP_MAX_ENDPOINTS);
-    CHECK(strcmp(netmap.peers[0].endpoints[3].ip, "10.0.0.4") == 0);
-    CHECK(netmap.peers[0].endpoints[3].port == 4);
+    CHECK(netmap.peer_count == 3);
+
+    /* Peer 0: notebook */
+    CHECK(strcmp(netmap.peers[0].tailscale_ip, "100.64.0.2") == 0);
+    CHECK(strcmp(netmap.peers[0].host_name, "notebook") == 0);
+    CHECK(netmap.peers[0].n_endpoints == 1);
+    CHECK(strcmp(netmap.peers[0].endpoints[0].ip, "203.0.113.10") == 0);
+    CHECK(netmap.peers[0].endpoints[0].port == 1111);
+
+    /* Peer 1: phone */
+    CHECK(strcmp(netmap.peers[1].tailscale_ip, "100.64.0.3") == 0);
+    CHECK(strcmp(netmap.peers[1].host_name, "phone") == 0);
+    CHECK(netmap.peers[1].n_endpoints == 1);
+    CHECK(strcmp(netmap.peers[1].endpoints[0].ip, "203.0.113.20") == 0);
+    CHECK(netmap.peers[1].endpoints[0].port == 2222);
+
+    /* Peer 2: orangepi (2 endpoints) */
+    CHECK(strcmp(netmap.peers[2].tailscale_ip, "100.64.0.4") == 0);
+    CHECK(strcmp(netmap.peers[2].host_name, "orangepi") == 0);
+    CHECK(netmap.peers[2].n_endpoints == 2);
+    CHECK(strcmp(netmap.peers[2].endpoints[0].ip, "203.0.113.30") == 0);
+    CHECK(strcmp(netmap.peers[2].endpoints[1].ip, "10.0.0.30") == 0);
+    CHECK(netmap.peers[2].endpoints[1].port == 3333);
+}
+
+static void test_map_parse_peer_endpoint_lan_late(void)
+{
+    /* HW 2026-09-03: el endpoint LAN del notebook viene DESPUÉS de varios
+     * endpoints docker 172.x en la lista. Con cap 4 se perdía y disco nunca
+     * lo probaba. Verifica que con el cap ampliado el LAN se captura. */
+    const char *json =
+        "{\"Self\":{\"Addrs\":[\"100.64.0.1/32\"]},"
+        "\"Peers\":[{"
+        "\"Key\":\"nodekey:4444444444444444444444444444444444444444444444444444444444444444\","
+        "\"AllowedIPs\":[\"100.64.0.5/32\"],"
+        "\"Endpoints\":[\"201.188.179.2:41641\",\"172.17.0.1:41641\","
+        "\"172.18.0.1:41641\",\"172.19.0.1:41641\",\"172.20.0.1:41641\","
+        "\"172.21.0.1:41641\",\"172.22.0.1:41641\",\"172.23.0.1:41641\","
+        "\"192.168.1.100:41641\"]"
+        "}]}";
+
+    tsnode_map_netmap_t netmap;
+    tsnode_err_t err = tsnode_map_parse_response(&netmap, json, strlen(json));
+    CHECK(err == TSNODE_OK);
+    CHECK(netmap.peers[0].n_endpoints == 9);
+    /* El endpoint LAN (índice 8) está capturado y accesible para disco */
+    CHECK(strcmp(netmap.peers[0].endpoints[8].ip, "192.168.1.100") == 0);
+    CHECK(netmap.peers[0].endpoints[8].port == 41641);
 }
 
 static void test_map_parse_peer_no_endpoints(void)
@@ -888,6 +1058,8 @@ int main(void)
     RUN(test_goaway_fails);
     RUN(test_oversize_frame_rejected);
     RUN(test_non_200_status_rejected);
+    RUN(test_hpack_leading_table_size_update_ok);
+    RUN(test_hpack_leading_table_size_update_non200_rejected);
     RUN(test_ping_gets_pong);
     RUN(test_h2_ping_gets_ack);
     RUN(test_h2_ping_server_ping_ponged);
@@ -904,6 +1076,8 @@ int main(void)
     RUN(test_map_parse_peer_endpoint_multi);
     RUN(test_map_parse_peer_endpoint_cap);
     RUN(test_map_parse_peer_no_endpoints);
+    RUN(test_map_parse_multi_peer_no_desync);
+    RUN(test_map_parse_peer_endpoint_lan_late);
 
     printf("%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed == 0 ? 0 : 1;

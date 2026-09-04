@@ -269,6 +269,41 @@ no_mem:
 
 /* ---- Manejo de frames recibidos ---- */
 
+/*
+ * Verifica que el bloque HPACK de una respuesta arranque con ":status 200"
+ * indexado (0x88). RFC 7541 §4.2 permite que el bloque venga precedido de
+ * UNO O MÁS "dynamic table size update" (0b001xxxxx) antes del primer header
+ * real; el encoder Go de Tailscale emite uno de tamaño 1 al arrancar cada
+ * bloque (verificado en hardware 2026-09-03), rompiendo la asunción previa
+ * de que 0x88 era el byte 0. Por eso los saltamos acá y exigimos 0x88 justo
+ * después. Cualquier otro encabezado antes del ":status" → fail-closed.
+ *
+ * Devuelve true si el bloque comienza (tras skip de size-update) con el
+ * ":status 200" indexado; false en cualquier otro caso.
+ */
+static bool hpack_starts_with_status_200(const uint8_t *blk, size_t len)
+{
+    if (blk == NULL || len < 1) return false;
+
+    size_t pos = 0;
+    /* Skip leading dynamic table size updates (RFC 7541 §4.2):
+     * primer byte 0b001xxxxx; si los 5 bits bajos son 0x1F, continúa en
+     * varint de 7 bits (bytes con bit alto seteado). */
+    for (;;) {
+        uint8_t b = blk[pos];
+        if ((b & 0xE0u) != 0x20u) break;   /* no es size update → parar */
+        pos++;
+        if ((b & 0x1Fu) == 0x1Fu) {        /* varint de 5 bits completo */
+            while (pos < len && (blk[pos] & 0x80u)) pos++;
+            if (pos >= len) return false;  /* varint truncado: hostil */
+        }
+        if (pos >= len) return false;
+    }
+
+    if (pos >= len) return false;
+    return blk[pos] == H2_HPACK_STATUS_200;
+}
+
 static tsnode_err_t handle_frame(h2_conn_t *h, const h2_frame_view_t *f,
                                  h2_resp_ctx_t *rc)
 {
@@ -323,8 +358,11 @@ static tsnode_err_t handle_frame(h2_conn_t *h, const h2_frame_view_t *f,
         if (!rc->seen_headers) {
             rc->seen_headers = true;
             /* Exigimos ":status 200" como header indexado de tabla estática
-             * (idx 8). Cualquier otro status o encoding → error. */
-            if (f->length < 1 || f->payload[0] != H2_HPACK_STATUS_200) {
+             * (idx 8). El bloque puede venir precedido de dynamic table size
+             * updates (RFC 7541 §4.2; el encoder Go emite uno de tamaño 1),
+             * que se saltan en hpack_starts_with_status_200. Cualquier otro
+             * status o encoding → error. */
+            if (!hpack_starts_with_status_200(f->payload, f->length)) {
                 return TSNODE_ERR_NETWORK;
             }
             if (f->flags & H2_FLAG_END_STREAM) rc->done = true;

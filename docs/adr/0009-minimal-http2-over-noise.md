@@ -75,18 +75,29 @@ Subset exactamente suficiente para register/map contra el control plane:
   DATA, HEADERS, SETTINGS (+ACK), WINDOW_UPDATE (ignorado), PING (→PONG),
   GOAWAY (→error explícito). CONTINUATION o cualquier frame inesperado →
   error fail-closed.
-- Validación mínima de respuesta HTTP: el bloque HEADERS debe empezar con el
+- Validación mínima de respuesta HTTP: el bloque HEADERS debe empezar (tras
+  saltar cualquier *dynamic table size update* HPACK, RFC 7541 §4.2) con el
   byte `0x88` (HPACK indexed field estático = `:status 200`); cualquier otra
   codificación/status → error. No se decodifica el resto de los headers.
+  - **Ampliación 2026-09-03 (hardware)**: el encoder HPACK Go del control
+    plane Tailscale emite hoy un *dynamic table size update* (`0x21`, size 1)
+    ANTES del `:status 200` indexado en cada bloque de respuesta. La versión
+    previa exigía `0x88` como byte 0 y rompía /machine/register con
+    `TSNODE_ERR_NETWORK` (verificado en hardware). El fix salta los size
+    updates iniciales antes de validar el `:status`; si el `:status` posterior
+    no es el indexado 200, sigue fallando fail-closed.
 
 **No vendorizamos nghttp2.** Razones: nuestro subset evita tablas dinámicas
 HPACK, Huffman, flow control adaptativo, push, CONTINUATION y multiplexing;
 nghttp2 arrastra toda esa superficie más su port a FreeRTOS. El subset cabe en
 ~500 líneas auditables con tests host-side y corpus de fuzz. Riesgo aceptado:
 si Tailscale exigiera features fuera del subset (p.ej. HPACK dinámico en sus
-respuestas — hoy no lo requiere porque nosotros no enviamos headers
-indexables), el cliente falla ruidosamente (fail-closed) y se reabre este ADR;
-nunca se degrada silenciosamente.
+respuestas), el cliente falla ruidosamente (fail-closed) y se reabre este ADR;
+nunca se degrada silenciosamente. **Estado 2026-09-03**: el "HPACK dinámico en
+sus respuestas" que este ADR anticipaba como riesgo apareció (size updates); se
+manejó siendo tolerante solo al size update inicial sin decodificar tablas
+dinámicas, y se documenta arriba. Si el servidor pasara a indexar headers en
+tabla dinámica (referencias `1xxx` a índices no-estáticos), se reabre este ADR.
 
 ### D2. MapRequest sin compresión
 

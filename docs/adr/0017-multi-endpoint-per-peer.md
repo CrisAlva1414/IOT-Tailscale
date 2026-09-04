@@ -28,11 +28,23 @@ botella era el struct del mapa (1 solo endpoint) y el cableado en
 ## Decisión
 
 - `tsnode_map_peer_t` ahora posee un array de hasta `TSNODE_MAP_MAX_ENDPOINTS
-  (=4)` endpoints, con contador `n_endpoints`.
+  (=16)` endpoints, con contador `n_endpoints`.
 - `tsnode_map_parse_response` parsea **todos** los endpoints del JSON
   `"Endpoints":[...]` hasta el techo fijo `TSNODE_MAP_MAX_ENDPOINTS` (cap en
   compile time; los extras se descartan, ver §Consecuencias de estabilidad).
 - `peer->online = (peer->n_endpoints > 0)`.
+- **Ampliación 2026-09-03 (hardware)**: el cap subió de 4 a 16. Los peers de la
+  tailnet real (notebook, OrangePi, PC) exponen entre 10 y 17 endpoints: la IP
+  pública + múltiples puentes Docker `172.x.y.1` + `192.168.122.1` (libvirt) +
+  el endpoint LAN-privado al final de la lista (p.ej. `192.168.1.100` en índice
+  8-15). Con cap=4 el LAN se perdía y disco nunca lo probaba. `disco.h`
+  `TSNODE_DISCO_MAX_ENDPOINTS` también sube a 16 para que disco pruebe todos los
+  candidatos que el parser conserva.
+- **Fix de desync (hardware 2026-09-03)**: el parser histórico avanzaba con
+  `strchr('{')` al objeto JSON siguiente, lo que se desalineaba cuando un peer
+  tenía `Hostinfo` con `{` anidado (Services/DERP), mezclando campos entre
+  peers. Ahora cada peer se ancla por su `"Key":"nodekey:` y toda búsqueda de
+  campos se acota a la ventana `[nodekey_actual, nodekey_siguiente)`.
 - `update_wg_peers` en `tsnode_client.c`:
   - Envía TODOS los endpoints parseados a `tsnode_disco_add_peer` para que disco
     los pruebe independientemente (así se alcanza el endpoint LAN-privado si hay
@@ -54,7 +66,7 @@ botella era el struct del mapa (1 solo endpoint) y el cableado en
   solo loop; disco ya cubre el descubrimiento asíncrono, así que no se duplica
   esa lógica en el path síncrono.
 - **Estructura dinámica (heap) para endpoints**: se descarta por AGENTS.md §4
-  (sin asignación dinámica no acotada en runtime crítico); el array fijo de 4 es
+  (sin asignación dinámica no acotada en runtime crítico); el array fijo de 16 es
   suficiente y acotado en compile time.
 
 ## Consecuencias de seguridad
@@ -74,13 +86,17 @@ botella era el struct del mapa (1 solo endpoint) y el cableado en
 
 ## Consecuencias de estabilidad
 
-- El cap fijo `TSNODE_MAP_MAX_ENDPOINTS=4` evita consumo de memoria por
+- El cap fijo `TSNODE_MAP_MAX_ENDPOINTS=16` evita consumo de memoria por
   cantidad arbitraria de endpoints declarados por el peer (acotado en compile
-  time). Tamaño de `tsnode_map_peer_t` crece un poco (array de 4 pares
-  ip[16]+port) pero es constante y conocido.
-- El techo de 4 es suficiente para los escenarios reales de Tailscale
-  (típicamente 1-2 endpoints por peer); si un peer trae más de 4, los sobrantes
-  se descartan con log, sin afectar estabilidad.
+  time). Tamaño de `tsnode_map_peer_t` crece (~16×18 B ≈ 288 B/peer, constante
+  y conocido; 16 peers ≈ 4.6 KB) — borde aceptable en ESP32, ADR-0009 D3.
+- El techo de 16 cubre los peers reales de la tailnet del operador (hasta 17
+  endpoints, ver §Decisión); si un peer trae más se descartan los sobrantes con
+  log, sin afectar estabilidad.
+- Con cap=4 (versión previa), los peers con >4 endpoints perdían el endpoint
+  LAN-privado que Tailscale emite al final de la lista, y disco nunca lo probaba:
+  el nodo quedaba sin ruta directa LAN-LAN pese a estar en la misma red.
+  Verificado en hardware 2026-09-03.
 - La carga de probe de disco ya existía; pasarle más endpoints solo aumenta
-  candidatos dentro del mismo presupuesto de `TSNODE_DISCO_MAX_ENDPOINTS`, ya
-  activo y testeado.
+  candidatos dentro del mismo presupuesto de `TSNODE_DISCO_MAX_ENDPOINTS` (=16),
+  ya activo y testeado.

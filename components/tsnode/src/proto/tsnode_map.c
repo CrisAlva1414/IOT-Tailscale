@@ -282,31 +282,53 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
     if (peers_start != NULL) {
         peers_start += strlen(peers_marker);
 
-        /* Scan for peer entries */
+        /* Scan for peer entries.
+         *
+         * Cada peer del array `Peers` está anclado por su `"Key":"nodekey:`.
+         * Los campos de un peer (Hostname/AllowedIPs/Endpoints/DiscoKey/PSK)
+         * aparecen TODOS después de su nodekey y ANTES del nodekey del peer
+         * siguiente. Usamos el nodekey de cada peer como ancla y acotamos toda
+         * búsqueda de campos a la ventana [nodekey_actual, nodekey_siguiente).
+         * Esto evita el desync histórico donde `strchr('{')` caía en un `{`
+         * anidado (p.ej. dentro de Hostinfo) y los campos se desalineaban un
+         * peer (bug HW 2026-09-03). */
         const char *scan = peers_start;
         while (scan != NULL && netmap->peer_count < TSNODE_MAP_MAX_PEERS) {
-            /* Find next peer object start */
-            const char *peer_start = strchr(scan, '{');
-            if (peer_start == NULL) break;
-            scan = peer_start + 1;
+            /* Ancla: nodekey del peer actual */
+            const char *key_marker =
+                strstr(scan, "\"Key\":\"nodekey:");
+            if (key_marker == NULL) break;
 
-            /* Check if we've exited the Peers array */
-            if (*peer_start == ']' || peer_start >= peers_start + strlen(peers_start) - 1) {
-                break;
-            }
+            /* Límite: nodekey del peer siguiente (o fin de cadena) */
+            const char *next_key = strstr(key_marker + 1, "\"Key\":\"nodekey:");
+            const char *peer_end = (next_key != NULL)
+                                       ? next_key
+                                       : key_marker + strlen(key_marker);
 
             tsnode_map_peer_t *peer = &netmap->peers[netmap->peer_count];
 
-            /* Find peer Key */
-            const char *key_end = find_next_node_key(peer_start, peer->key);
-            if (key_end == NULL) continue;
+            /* Peer Key */
+            const char *hex = key_marker + strlen("\"Key\":\"nodekey:");
+            if (strlen(hex) < 64) break;
+            if (hex_to_bytes(peer->key, 32, hex, 64) != 0) break;
 
-            /* Find Hostname (in HostInfo sub-object) */
-            find_json_string(peer_start, "Hostname",
-                            peer->host_name, sizeof(peer->host_name));
+            /* Find Hostname (in HostInfo sub-object), acotado a este peer */
+            const char *hn = NULL;
+            {
+                const char *hit = strstr(key_marker, "\"Hostname\"");
+                if (hit != NULL && hit < peer_end) hn = hit;
+            }
+            if (hn != NULL) {
+                find_json_string(hn, "Hostname",
+                                 peer->host_name, sizeof(peer->host_name));
+            }
 
             /* Find AllowedIPs — parse first CIDR entry (e.g. "100.64.0.1/32") */
-            const char *allowed = strstr(peer_start, "\"AllowedIPs\"");
+            const char *allowed = NULL;
+            {
+                const char *hit = strstr(key_marker, "\"AllowedIPs\"");
+                if (hit != NULL && hit < peer_end) allowed = hit;
+            }
             if (allowed != NULL) {
                 const char *ip = strstr(allowed, "\"100.");
                 if (ip != NULL) {
@@ -334,15 +356,30 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
             }
 
             /* Find Endpoints — format: "Endpoints":["ip:port",...]
-             * Parse ALL endpoints up to TSNODE_MAP_MAX_ENDPOINTS. */
-            const char *ep = strstr(peer_start, "\"Endpoints\"");
+             * Parse endpoints in order hasta TSNODE_MAP_MAX_ENDPOINTS. El
+             * primer endpoint (endpoints[0]) lo usa el handshake WG de
+             * arranque; disco (por debajo) prueba TODOS los endpoints, así
+             * que la selección fina de ruta LAN vs pública la resuelve disco,
+             * no este parser. */
+            const char *ep = NULL;
+            {
+                const char *hit = strstr(key_marker, "\"Endpoints\"");
+                if (hit != NULL && hit < peer_end) ep = hit;
+            }
             if (ep != NULL) {
                 const char *bracket = strchr(ep + 12, '[');
                 if (bracket != NULL) {
+                    /* Acotar el barrido al array Endpoints (hasta su `]` de
+                     * cierre). Crítico: sin esto, tras el último endpoint el
+                     * strchr('"') se escapaba hacia el peer siguiente y su
+                     * "Key"/AllowedIPs se parseaban como endpoints falsos
+                     * (desync HW 2026-09-03). */
+                    const char *close = strchr(bracket, ']');
                     const char *scan_ep = bracket + 1;
-                    while (peer->n_endpoints < TSNODE_MAP_MAX_ENDPOINTS) {
+                    while (peer->n_endpoints < TSNODE_MAP_MAX_ENDPOINTS &&
+                           close != NULL && scan_ep < close) {
                         const char *q = strchr(scan_ep, '"');
-                        if (q == NULL || q[1] == ']') break;
+                        if (q == NULL || q >= close) break;
                         q++; /* skip opening quote */
                         /* Copy IP until colon */
                         size_t iplen = 0;
@@ -368,7 +405,11 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
             }
 
             /* Find PresharedKey — hex-encoded 32-byte key */
-            const char *psk = strstr(peer_start, "\"PresharedKey\"");
+            const char *psk = NULL;
+            {
+                const char *hit = strstr(key_marker, "\"PresharedKey\"");
+                if (hit != NULL && hit < peer_end) psk = hit;
+            }
             if (psk != NULL) {
                 const char *psk_hex = strchr(psk, '"');
                 if (psk_hex != NULL) {
@@ -382,10 +423,15 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
             }
 
             /* Find DiscoKey — hex-encoded 32-byte key (discokey:hex) */
-            const char *dk = strstr(peer_start, "\"DiscoKey\"");
+            const char *dk = NULL;
+            {
+                const char *hit = strstr(key_marker, "\"DiscoKey\"");
+                if (hit != NULL && hit < peer_end) dk = hit;
+            }
             if (dk != NULL) {
                 /* Skip past the "DiscoKey" key literal to the ':' then value */
-                const char *colon = strchr(dk + strlen("\"DiscoKey\""), ':');
+                const char *colon =
+                    strchr(dk + strlen("\"DiscoKey\""), ':');
                 if (colon != NULL) {
                     const char *dk_hex = colon + 1;
                     /* Skip whitespace and opening quote */
@@ -409,8 +455,9 @@ tsnode_err_t tsnode_map_parse_response(tsnode_map_netmap_t *netmap,
             peer->online = (peer->n_endpoints > 0);
             netmap->peer_count++;
 
-            /* Move past this peer object */
-            scan = key_end;
+            /* Move past this peer's key marker; next iteration finds the
+             * next peer anchored by its own nodekey. */
+            scan = peer_end;
         }
     }
 

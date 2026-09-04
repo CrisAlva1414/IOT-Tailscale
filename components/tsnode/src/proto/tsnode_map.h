@@ -23,8 +23,12 @@ extern "C" {
 /* Maximum peers we track (ESP32 memory constraint) */
 #define TSNODE_MAP_MAX_PEERS 16
 
-/* Maximum endpoints per peer (matches disco layer) */
-#define TSNODE_MAP_MAX_ENDPOINTS 4
+/* Maximum endpoints per peer (matches disco layer).
+ * 16: peers con muchos endpoints (público + múltiples docker 172.x + LAN
+ * privada) necesitan alcanzar el endpoint LAN que viene al final de la lista
+ * (HW 2026-09-03: LAN del notebook en índice 8-15). Cap grande pero acotado;
+ * ~16*18B = 288B/peer, borde aceptable en ESP32. */
+#define TSNODE_MAP_MAX_ENDPOINTS 16
 
 /* STUN server from DERP map */
 typedef struct {
