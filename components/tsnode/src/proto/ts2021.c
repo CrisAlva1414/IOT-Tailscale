@@ -430,8 +430,9 @@ tsnode_err_t ts2021_record_recv(ts2021_conn_t *conn, uint8_t *buf,
     /* Read header: type(1) + length(2) */
     uint8_t header[3];
     size_t header_read;
+    uint32_t timeout = conn->recv_timeout_ms ? conn->recv_timeout_ms : 10000;
     tsnode_err_t err = ts2021_conn_read(conn, header,
-                                         sizeof(header), &header_read, 10000);
+                                         sizeof(header), &header_read, timeout);
     if (err != TSNODE_OK) {
         TSNODE_LOGE(TAG, "recv header read err=%d", err);
         return err;
@@ -466,7 +467,7 @@ tsnode_err_t ts2021_record_recv(ts2021_conn_t *conn, uint8_t *buf,
     /* Read ciphertext */
     uint8_t ct_buf[NOISE_MAX_FRAME];
     size_t ct_read;
-    err = ts2021_conn_read(conn, ct_buf, ct_len, &ct_read, 10000);
+    err = ts2021_conn_read(conn, ct_buf, ct_len, &ct_read, timeout);
     if (err != TSNODE_OK) return err;
     if (ct_read != ct_len) return TSNODE_ERR_NETWORK;
 
@@ -529,6 +530,13 @@ void ts2021_conn_prebuffer(ts2021_conn_t *conn, const uint8_t *data,
     memcpy(conn->prebuf + conn->prebuf_len, data, len);
     conn->prebuf_len += len;
     TSNODE_LOGI(TAG, "prebuffered %zu bytes (total %zu)", len, conn->prebuf_len);
+}
+
+void ts2021_set_recv_timeout(ts2021_conn_t *conn, uint32_t timeout_ms)
+{
+    if (conn == NULL) return;
+    conn->recv_timeout_ms = timeout_ms;
+    TSNODE_LOGI(TAG, "recv timeout set to %u ms", (unsigned)timeout_ms);
 }
 
 /* Read from prebuf first, then socket */
@@ -783,6 +791,7 @@ tsnode_err_t ts2021_handshake_complete(
     conn->sock = sock;
     conn->established = true;
     conn->prebuf_len = 0;
+    conn->recv_timeout_ms = 10000;  /* Default: 10s per-record timeout */
 
     mbedtls_platform_zeroize(&s, sizeof(s));
     mbedtls_platform_zeroize(derived, sizeof(derived));

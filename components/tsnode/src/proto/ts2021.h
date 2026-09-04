@@ -36,6 +36,7 @@ typedef struct {
      * this buffer first, then from the socket. */
     uint8_t prebuf[512];             /* Pre-buffered data */
     size_t prebuf_len;               /* Valid bytes in prebuf */
+    uint32_t recv_timeout_ms;        /* Per-record recv timeout (ms) */
 } ts2021_conn_t;
 
 /*
@@ -119,6 +120,14 @@ void ts2021_conn_close(ts2021_conn_t *conn);
  */
 void ts2021_conn_prebuffer(ts2021_conn_t *conn, const uint8_t *data,
                             size_t len);
+
+/*
+ * Set per-record recv timeout in milliseconds.  Default is 10000 (10s),
+ * suitable for interactive exchanges.  Long-poll endpoints (e.g.
+ * /machine/map) need a longer timeout (300s) because the server holds the
+ * connection open for up to several minutes waiting for state changes.
+ */
+void ts2021_set_recv_timeout(ts2021_conn_t *conn, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

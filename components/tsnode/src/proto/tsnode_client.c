@@ -1040,10 +1040,19 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
     char lb_value[8 + 64 + 1];
     snprintf(lb_value, sizeof(lb_value), "nodekey:%s", s_node_key_pub_hex);
 
+    /* Long-poll: the server holds /machine/map open for up to ~5 minutes
+     * waiting for state changes.  Increase the per-record recv timeout
+     * from the default 10s to 300s so we don't TIME out during the
+     * server's idle period.  Restore after the POST returns. */
+    ts2021_set_recv_timeout(&s_conn, 300000);
+
     size_t map_wire_len;
     err = h2_post(&s_h2, s_config.control_host, "/machine/map",
                   lb_value, (const uint8_t *)map_req, map_req_len,
                   s_map_resp, sizeof(s_map_resp) - 1, &map_wire_len);
+
+    ts2021_set_recv_timeout(&s_conn, 10000);  /* restore default */
+
     if (err != TSNODE_OK) {
         TSNODE_LOGE(TAG, "map POST failed: %d", err);
         return err;
