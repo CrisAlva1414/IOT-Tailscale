@@ -112,11 +112,18 @@ int tsnode_x25519_publickey(const uint8_t priv[32], uint8_t pub_out[32])
      * Byte-level clamping alone is insufficient because mbedTLS
      * validates bitlen(d)-1 == 254, which requires bit 254 to be
      * explicitly set. We do all clamping at the MPI level to guarantee
-     * the key passes mbedtls_ecp_check_privkey(). */
+     * the key passes mbedtls_ecp_check_privkey().
+     * IMPORTANTE: mbedTLS también rechaza escalares con bit 255 puesto
+     * (bitlen 256 -> BAD_INPUT_DATA -0x4c80, verificado empíricamente
+     * con la misma versión de mbedTLS); una clave aleatoria cruda lo
+     * tiene con p=1/2. Clear bit 255 completa el clamp RFC 7748 y hace
+     * que recibir/derivar públicas desde privadas arbitrarias sea
+     * determinista en vez de un coin-flip. */
     mbedtls_mpi_set_bit(&d, 0, 0);   /* clear bit 0 */
     mbedtls_mpi_set_bit(&d, 1, 0);   /* clear bit 1 */
     mbedtls_mpi_set_bit(&d, 2, 0);   /* clear bit 2 (cofactor clearing) */
     mbedtls_mpi_set_bit(&d, 254, 1); /* ensure bit 254 is set */
+    mbedtls_mpi_set_bit(&d, 255, 0); /* clear bit 255: bitlen <= 255 (RFC 7748) */
 
     if (ensure_rng() != 0) { ret = -1; goto cleanup; }
     ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G,
@@ -167,6 +174,16 @@ int tsnode_x25519_shared(uint8_t shared[32], const uint8_t priv[32],
      * mbedTLS or by caller) */
     ret = mbedtls_mpi_read_binary_le(&d, priv, 32);
     if (ret != 0) goto cleanup;
+
+    /* Clamp RFC 7748 §5 de forma defensiva: X25519 por definición clampea
+     * su escalar, y mbedTLS rechaza (BAD_INPUT_DATA) escalares con bit 255
+     * puesto o sin bit 254. Idempotente para claves ya clampeadas (todos
+     * los callers actuales vienen de tsnode_x25519_keygen o NVS). */
+    mbedtls_mpi_set_bit(&d, 0, 0);
+    mbedtls_mpi_set_bit(&d, 1, 0);
+    mbedtls_mpi_set_bit(&d, 2, 0);
+    mbedtls_mpi_set_bit(&d, 254, 1);
+    mbedtls_mpi_set_bit(&d, 255, 0);
 
     /* Import public key from compressed format */
     ret = mbedtls_ecp_point_read_binary(&grp, &Q, pub, 32);

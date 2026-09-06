@@ -60,6 +60,19 @@ void tsnode_port_task_delete_self(void);
  */
 void tsnode_port_delay_ms(uint32_t ms);
 
+/*
+ * Exclusión mutua entre tareas (ADR-0011: el device WireGuard se comparte
+ * entre la tarea UDP y la tarea del cliente que actualiza peers). Instancia
+ * única estática para toda la vida del componente — sin heap, secciones de
+ * lock cortas (nunca dentro de crypto de >ms), sin prioridad inversa
+ * material. create() es idempotente: devuelve la misma instancia en
+ * llamadas sucesivas.
+ */
+typedef struct tsnode_port_mutex tsnode_port_mutex_t;
+tsnode_err_t tsnode_port_mutex_create(tsnode_port_mutex_t **out_mtx);
+void tsnode_port_mutex_lock(tsnode_port_mutex_t *mtx);
+void tsnode_port_mutex_unlock(tsnode_port_mutex_t *mtx);
+
 /* --- Logging (ADR-0006: sin headers de plataforma en core) --- */
 
 /* Log callback registrado por la app. level: 0=error, 1=warn, 2=info, 3=debug */

@@ -12,6 +12,7 @@
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include "tsnode_port.h"
@@ -120,4 +121,43 @@ void tsnode_port_task_delete_self(void)
 void tsnode_port_delay_ms(uint32_t ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+/* ---- Mutex (instancia única estática; ver tsnode_port.h) ---- */
+
+struct tsnode_port_mutex {
+    SemaphoreHandle_t sem;
+};
+
+static tsnode_port_mutex_t s_tsnode_mutex;
+
+tsnode_err_t tsnode_port_mutex_create(tsnode_port_mutex_t **out_mtx)
+{
+    if (out_mtx == NULL) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+    if (s_tsnode_mutex.sem == NULL) {
+        s_tsnode_mutex.sem = xSemaphoreCreateMutex();
+        if (s_tsnode_mutex.sem == NULL) {
+            return TSNODE_ERR_NO_MEMORY;
+        }
+    }
+    *out_mtx = &s_tsnode_mutex;
+    return TSNODE_OK;
+}
+
+void tsnode_port_mutex_lock(tsnode_port_mutex_t *mtx)
+{
+    if (mtx == NULL || mtx->sem == NULL) {
+        return;
+    }
+    xSemaphoreTake(mtx->sem, portMAX_DELAY);
+}
+
+void tsnode_port_mutex_unlock(tsnode_port_mutex_t *mtx)
+{
+    if (mtx == NULL || mtx->sem == NULL) {
+        return;
+    }
+    xSemaphoreGive(mtx->sem);
 }

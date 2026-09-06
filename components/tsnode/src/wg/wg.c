@@ -626,8 +626,14 @@ tsnode_err_t tsnode_wg_create_response(tsnode_wg_device_t *dev, int peer_idx,
     uint8_t nonce[12];
     uint32_t local_index;
 
-    if (cr->random(eph_priv, TSNODE_WG_KEY_LEN) != TSNODE_OK ||
-        cr->pubkey(eph_pub, eph_priv) != TSNODE_OK ||
+    /* Ephemeral via keygen (no random()+pubkey()): mbedTLS rechaza escalares
+     * de 256 bits (bit 255 puesto) con BAD_INPUT_DATA — una clave aleatoria
+     * cruda lo tiene con p=1/2, así que create_response fallaba de forma
+     * intermitente al responder handshakes entrantes (observado en hardware:
+     * "ecp_mul pubkey failed: -0x4c80" en RX init del notebook). keygen
+     * genera escalar clampeado RFC 7748 (bit 255 en 0, bit 254 en 1) de la
+     * misma forma que create_initiation, que sí pudo establecer sesiones. */
+    if (cr->keygen(eph_priv, eph_pub) != TSNODE_OK ||
         cr->dh(ee, eph_priv, peer->hs_remote_eph_pub) != TSNODE_OK ||
         cr->dh(se, eph_priv, peer->cfg.public_key) != TSNODE_OK) {
         hs_clear_secrets(peer);

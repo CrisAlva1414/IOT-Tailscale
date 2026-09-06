@@ -31,6 +31,7 @@ typedef struct {
     uint32_t tx_initiation;
     uint32_t tx_response;
     uint32_t tx_transport;
+    uint32_t tx_keepalive;
     uint32_t rx_initiation;
     uint32_t rx_response;
     uint32_t rx_transport;
@@ -43,10 +44,11 @@ static wg_pkt_counters_t s_wg_counters;
 
 static void wg_log_counters(void)
 {
-    TSNODE_LOGI(TAG, "WG counters: TX init=%lu resp=%lu data=%lu | RX init=%lu resp=%lu data=%lu keep=%lu err=%lu unk=%lu",
+    TSNODE_LOGI(TAG, "WG counters: TX init=%lu resp=%lu data=%lu keep=%lu | RX init=%lu resp=%lu data=%lu keep=%lu err=%lu unk=%lu",
                 (unsigned long)s_wg_counters.tx_initiation,
                 (unsigned long)s_wg_counters.tx_response,
                 (unsigned long)s_wg_counters.tx_transport,
+                (unsigned long)s_wg_counters.tx_keepalive,
                 (unsigned long)s_wg_counters.rx_initiation,
                 (unsigned long)s_wg_counters.rx_response,
                 (unsigned long)s_wg_counters.rx_transport,
@@ -817,8 +819,54 @@ static tsnode_err_t do_connect(void)
 /* WireGuard device and UDP socket for data plane (ADR-0011) */
 static tsnode_wg_device_t s_wg_dev;
 static tsnode_port_udp_socket_t *s_wg_sock;
+static tsnode_port_mutex_t *s_wg_mutex; /* serializa s_wg_dev entre tareas */
 #define WG_RECV_BUF_SIZE 1500
 #define WG_RECV_QUEUE_LEN 8
+
+/* Retransmision de handshake WG (GOAL-5). WireGuard reenvía el handshake
+ * initiation cada ~5s (REKEY_TIMEOUT con jitter) hasta ~90s; sin esto, un
+ * initiation enviado antes de que el peer conozca nuestro endpoint (o hacia
+ * un endpoint público hairpin previo a que disco confirme la ruta directa)
+ * se pierde para siempre y el data plane no arranca aunque disco ya tenga
+ * la ruta directa confirmada (ADR-0018). El cadence corre en la tarea UDP
+ * (wg_recv_task), que está viva incluso durante el long-poll de /machine/map
+ * donde la tarea del cliente queda bloqueada hasta 300s.
+ *
+ * s_wg_ep_ip/port recuerdan el último endpoint usado por update_wg_peers;
+ * s_wg_hs_attempts limita el reintento a ~90s (como REKEY_ATTEMPT_TIME de
+ * wireguard-go) y se resetea con cada poll exitoso o paquete válido del peer. */
+#define WG_RETRANSMIT_INTERVAL_S   5
+#define WG_RETRANSMIT_MAX_ATTEMPTS 18  /* 5s * 18 = 90s techo */
+/* Keepalive de sesión WireGuard: la spec envía un transport data vacío si no
+ * se envió nada en 10s (mantiene NAT binding y confirma la sesión al peer). */
+#define WG_KEEPALIVE_IDLE_MS 10000u
+static uint32_t s_wg_ep_ip[TSNODE_WG_MAX_PEERS];
+static uint16_t s_wg_ep_port[TSNODE_WG_MAX_PEERS];
+static uint32_t s_wg_hs_attempts[TSNODE_WG_MAX_PEERS];
+static uint32_t s_wg_last_retransmit_ms;
+static uint32_t s_wg_last_tx_ms[TSNODE_WG_MAX_PEERS]; /* último envío de transporte autenticado */
+
+/* TAI64N desde uptime (monotónico, siempre creciente) — timestamp del
+ * handshake WireGuard. */
+static void wg_build_tai64n(uint8_t ts[12])
+{
+    uint64_t now_ms;
+    tsnode_port_uptime_ms(&now_ms);
+    uint32_t sec = (uint32_t)(now_ms / 1000);
+    uint32_t nsec = (uint32_t)((now_ms % 1000) * 1000000);
+    ts[0] = (uint8_t)(40); /* TAI64N century: 0x40 = 2000s era */
+    ts[1] = (uint8_t)(1);
+    ts[2] = (uint8_t)(1);
+    ts[3] = (uint8_t)(1);
+    ts[4] = (uint8_t)(sec >> 24);
+    ts[5] = (uint8_t)(sec >> 16);
+    ts[6] = (uint8_t)(sec >> 8);
+    ts[7] = (uint8_t)(sec);
+    ts[8] = (uint8_t)(nsec >> 24);
+    ts[9] = (uint8_t)(nsec >> 16);
+    ts[10] = (uint8_t)(nsec >> 8);
+    ts[11] = (uint8_t)(nsec);
+}
 
 static tsnode_err_t init_wg_device(void)
 {
@@ -830,7 +878,14 @@ static tsnode_err_t init_wg_device(void)
     }
     TSNODE_LOGI(TAG, "WireGuard device initialized");
 
-    /* Initialize disco subsystem (ADR-0014) */
+    /* Mutex para el device WG compartido entre la tarea UDP y la tarea del
+     * cliente (ADR-0011). Idempotente; nunca se destruye (instancia única). */
+    err = tsnode_port_mutex_create(&s_wg_mutex);
+    if (err != TSNODE_OK) {
+        TSNODE_LOGW(TAG, "WG mutex create failed: %d", err);
+    }
+
+    /* Disco subsystem (ADR-0014) */
     err = tsnode_disco_load_or_generate(&s_disco, s_node_key_pub, crypto);
     if (err != TSNODE_OK) {
         TSNODE_LOGW(TAG, "disco init failed: %d (data plane will not work behind NAT)", err);
@@ -932,30 +987,23 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
          * the parser stores endpoints in MapResponse order and disco probes
          * all of them independently). */
         if (!tsnode_wg_peer_has_session(&s_wg_dev, idx)) {
-            uint64_t now_ms;
-            tsnode_port_uptime_ms(&now_ms);
-
-            /* TAI64N timestamp from uptime (monotonic, always increasing) */
             uint8_t ts[12];
-            uint32_t sec = (uint32_t)(now_ms / 1000);
-            uint32_t nsec = (uint32_t)((now_ms % 1000) * 1000000);
-            ts[0] = (uint8_t)(40); /* TAI64N century: 0x40 = 2000s era */
-            ts[1] = (uint8_t)(1);
-            ts[2] = (uint8_t)(1);
-            ts[3] = (uint8_t)(1);
-            ts[4] = (uint8_t)(sec >> 24);
-            ts[5] = (uint8_t)(sec >> 16);
-            ts[6] = (uint8_t)(sec >> 8);
-            ts[7] = (uint8_t)(sec);
-            ts[8] = (uint8_t)(nsec >> 24);
-            ts[9] = (uint8_t)(nsec >> 16);
-            ts[10] = (uint8_t)(nsec >> 8);
-            ts[11] = (uint8_t)(nsec);
+            wg_build_tai64n(ts);
+
+            /* Toda mutación de s_wg_dev va bajo el mutex: la tarea UDP
+             * (wg_recv_task) consume/estructura sesiones concurrentemente
+             * (ADR-0011), incl. la retransmisión de handshake (GOAL-5). */
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_lock(s_wg_mutex);
+            }
 
             uint8_t initiation[TSNODE_WG_INITIATION_LEN];
             TSNODE_LOGI(TAG, "WG TX initiation peer=%d key=...%02x%02x", idx, mp->key[30], mp->key[31]);
             err = tsnode_wg_create_initiation(&s_wg_dev, idx, ts, initiation);
             if (err != TSNODE_OK) {
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 TSNODE_LOGE(TAG, "WG create_initiation failed: %d (peer %d)", err, idx);
                 continue;
             }
@@ -995,9 +1043,18 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
                 ep_port = mp->endpoints[0].port;
             }
 
+            /* Recuerda el endpoint elegido para la retransmisión 5s y arma
+             * el contador de intentos de la retransmisión (GOAL-5). */
+            s_wg_ep_ip[idx] = ep_ip;
+            s_wg_ep_port[idx] = ep_port;
+            s_wg_hs_attempts[idx] = 1;
+
             err = tsnode_port_udp_sendto(s_wg_sock, initiation,
                                           sizeof(initiation),
                                           ep_ip, ep_port);
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_unlock(s_wg_mutex);
+            }
             if (err != TSNODE_OK) {
                 TSNODE_LOGW(TAG, "WG TX initiation FAILED: %d peer=%d dst=%s:%u t=%lu ms",
                             err, idx, ep_dst, ep_port,
@@ -1141,6 +1198,160 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
 
 /* ---- WireGuard UDP receive task (ADR-0011) ---- */
 
+/* Envía un keepalive WireGuard (transport data con payload vacío) al peer.
+ * WireGuard exige que el iniciador confirme la sesión con su primer paquete
+ * de transporte autenticado: sin él, el responder (tailscaled/wireguard-go)
+ * no activa la sesión ni envía datos. Observado en hardware: sessions
+ * ESTABLISHED con 3 peers y cero tráfico de datos pese a direct path. El
+ * keepalive periódico a 10s (spec WireGuard: keepalive si no se envió nada
+ * en 10s) mantiene viva la sesión y refresca el NAT binding.
+ * Comparte la resolución de endpoint con wg_retransmit_pending: prefiere la
+ * ruta directa confirmada por disco en el momento del envío. */
+static void wg_send_keepalive(int peer_idx)
+{
+    if (peer_idx < 0 || peer_idx >= (int)TSNODE_WG_MAX_PEERS ||
+        !s_wg_dev.peers[peer_idx].used ||
+        !tsnode_wg_peer_has_session(&s_wg_dev, peer_idx)) {
+        return;
+    }
+
+    uint32_t ep_ip = s_wg_ep_ip[peer_idx];
+    uint16_t ep_port = s_wg_ep_port[peer_idx];
+    if (s_disco_initialized) {
+        int dp_idx = tsnode_disco_find_peer_by_wg_key(
+            &s_disco, s_wg_dev.peers[peer_idx].cfg.public_key);
+        if (dp_idx >= 0) {
+            uint32_t d_ip = 0;
+            uint16_t d_port = 0;
+            if (tsnode_disco_get_peer_endpoint(&s_disco, dp_idx,
+                                               &d_ip, &d_port)) {
+                ep_ip = d_ip;
+                ep_port = d_port;
+            }
+        }
+    }
+    if (ep_ip == 0) {
+        return; /* aún sin endpoint conocido */
+    }
+
+    /* Payload vacío con puntero no-NULL (NULL con len 0 es aceptado por
+     * mbedtls que solo lee si len>0, pero es UB en C11 — usar dummy). */
+    uint8_t empty = 0;
+    uint8_t keep[TSNODE_WG_TRANSPORT_OVERHEAD + 1];
+    size_t keep_len = 0;
+    uint64_t now_ms;
+    tsnode_port_uptime_ms(&now_ms);
+
+    if (s_wg_mutex != NULL) {
+        tsnode_port_mutex_lock(s_wg_mutex);
+    }
+    tsnode_err_t err = tsnode_wg_encap(&s_wg_dev, peer_idx, &empty, 0,
+                                       now_ms, keep, sizeof(keep), &keep_len);
+    if (s_wg_mutex != NULL) {
+        tsnode_port_mutex_unlock(s_wg_mutex);
+    }
+    if (err != TSNODE_OK) {
+        TSNODE_LOGW(TAG, "WG keepalive encap failed: %d peer=%d", err, peer_idx);
+        return;
+    }
+
+    err = tsnode_port_udp_sendto(s_wg_sock, keep, keep_len, ep_ip, ep_port);
+    if (err != TSNODE_OK) {
+        TSNODE_LOGW(TAG, "WG keepalive send failed: %d peer=%d", err, peer_idx);
+        return;
+    }
+    s_wg_counters.tx_keepalive++;
+    s_wg_last_tx_ms[peer_idx] = (uint32_t)now_ms;
+    TSNODE_LOGI(TAG, "WG TX keepalive #%lu peer=%d -> %u.%u.%u.%u:%u len=%u t=%lu ms",
+                (unsigned long)s_wg_counters.tx_keepalive, peer_idx,
+                (ep_ip >> 24) & 0xFF, (ep_ip >> 16) & 0xFF,
+                (ep_ip >> 8) & 0xFF, ep_ip & 0xFF, ep_port,
+                (unsigned)keep_len, (unsigned long)ts_rel_ms());
+}
+
+/* Retransmisión de handshake iniciations pendientes — WireGuard reenvía el
+ * que un initiation perdido (peer aún sin nuestro endpoint, o enviado a un
+ * endpoint público pre-disco) se recupere cuando disco ya confirmó la ruta
+ * directa (ADR-0018). Corre en la tarea UDP para que siga activa durante el
+ * long-poll de /machine/map (la tarea del cliente queda bloqueada hasta
+ * 300s ahí). Reusa el último endpoint elegido por update_wg_peers, pero
+ * prefiere la ruta directa confirmada por disco en el momento del retry. */
+static void wg_retransmit_pending(void)
+{
+    uint64_t now_ms;
+    tsnode_port_uptime_ms(&now_ms);
+
+    for (uint8_t idx = 0; idx < TSNODE_WG_MAX_PEERS; idx++) {
+        if (!s_wg_dev.peers[idx].used) {
+            continue;
+        }
+        if (tsnode_wg_peer_has_session(&s_wg_dev, idx)) {
+            /* Sesión activa: keepalive de mantenimiento cada 10s de idle
+             * (spec WireGuard). También confirma la sesión del lado del
+             * responder (GOAL-5): sin el primer transport autenticado, el
+             * peer no activa la sesión. */
+            if ((uint32_t)now_ms - s_wg_last_tx_ms[idx] >=
+                WG_KEEPALIVE_IDLE_MS) {
+                wg_send_keepalive(idx);
+            }
+            continue; /* sesión activa: no hay nada que retransmitir */
+        }
+        if (s_wg_hs_attempts[idx] == 0 ||
+            s_wg_hs_attempts[idx] > WG_RETRANSMIT_MAX_ATTEMPTS) {
+            continue; /* no armado por update_wg_peers, o techo alcanzado */
+        }
+
+        uint32_t ep_ip = s_wg_ep_ip[idx];
+        uint16_t ep_port = s_wg_ep_port[idx];
+        if (s_disco_initialized) {
+            int dp_idx = tsnode_disco_find_peer_by_wg_key(
+                &s_disco, s_wg_dev.peers[idx].cfg.public_key);
+            if (dp_idx >= 0) {
+                uint32_t d_ip = 0;
+                uint16_t d_port = 0;
+                if (tsnode_disco_get_peer_endpoint(&s_disco, dp_idx,
+                                                   &d_ip, &d_port)) {
+                    ep_ip = d_ip;
+                    ep_port = d_port;
+                }
+            }
+        }
+        if (ep_ip == 0) {
+            continue; /* aún sin endpoint conocido */
+        }
+
+        uint8_t ts[12];
+        wg_build_tai64n(ts);
+
+        uint8_t initiation[TSNODE_WG_INITIATION_LEN];
+        if (s_wg_mutex != NULL) {
+            tsnode_port_mutex_lock(s_wg_mutex);
+        }
+        tsnode_err_t err = tsnode_wg_create_initiation(&s_wg_dev, idx, ts,
+                                                       initiation);
+        if (err == TSNODE_OK) {
+            err = tsnode_port_udp_sendto(s_wg_sock, initiation,
+                                         sizeof(initiation), ep_ip, ep_port);
+        }
+        if (s_wg_mutex != NULL) {
+            tsnode_port_mutex_unlock(s_wg_mutex);
+        }
+        if (err != TSNODE_OK) {
+            TSNODE_LOGW(TAG, "WG retransmit fail peer=%d ep=%u.%u.%u.%u:%u err=%d",
+                        idx, (ep_ip >> 24) & 0xFF, (ep_ip >> 16) & 0xFF,
+                        (ep_ip >> 8) & 0xFF, ep_ip & 0xFF, ep_port, err);
+            continue;
+        }
+        s_wg_counters.tx_initiation++;
+        s_wg_hs_attempts[idx]++;
+        TSNODE_LOGI(TAG, "WG TX init retry #%lu peer=%d -> %u.%u.%u.%u:%u len=%d t=%lu ms",
+                    (unsigned long)s_wg_counters.tx_initiation, idx,
+                    (ep_ip >> 24) & 0xFF, (ep_ip >> 16) & 0xFF,
+                    (ep_ip >> 8) & 0xFF, ep_ip & 0xFF, ep_port,
+                    TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
+    }
+}
+
 static void wg_recv_task(void *arg)
 {
     (void)arg;
@@ -1153,6 +1364,18 @@ static void wg_recv_task(void *arg)
         size_t nread;
         uint32_t src_ip;
         uint16_t src_port;
+
+        /* Cadence de retransmisión de handshake WG (GOAL-5): por tiempo de
+         * pared (no por iteraciones), cada 5s. La tarea UDP está viva
+         * durante el long-poll de /machine/map en el que la tarea del
+         * cliente queda bloqueada. */
+        uint64_t now_ms;
+        tsnode_port_uptime_ms(&now_ms);
+        if ((uint32_t)now_ms - s_wg_last_retransmit_ms >=
+            WG_RETRANSMIT_INTERVAL_S * 1000u) {
+            s_wg_last_retransmit_ms = (uint32_t)now_ms;
+            wg_retransmit_pending();
+        }
 
         tsnode_err_t err = tsnode_port_udp_recvfrom(s_wg_sock, pkt_buf,
                                                      sizeof(pkt_buf), &nread,
@@ -1198,12 +1421,21 @@ static void wg_recv_task(void *arg)
                         nread, (unsigned long)ts_rel_ms());
 
             int peer_idx = -1;
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_lock(s_wg_mutex);
+            }
             err = tsnode_wg_consume_initiation(&s_wg_dev, pkt_buf, nread,
                                                 &peer_idx);
             if (err != TSNODE_OK) {
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 TSNODE_LOGW(TAG, "WG consume_initiation failed: %d", err);
                 continue;
             }
+            /* El peer puede alcanzarnos: resetear la retransmisión hacia él
+             * (el reintento a 5s solo aplica mientras la ruta es dudosa). */
+            s_wg_hs_attempts[peer_idx] = 0;
 
             /* Build and send response */
             uint64_t now_ms;
@@ -1212,8 +1444,14 @@ static void wg_recv_task(void *arg)
             err = tsnode_wg_create_response(&s_wg_dev, peer_idx, now_ms,
                                              response);
             if (err != TSNODE_OK) {
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 TSNODE_LOGW(TAG, "WG create_response failed: %d", err);
                 continue;
+            }
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_unlock(s_wg_mutex);
             }
 
             err = tsnode_port_udp_sendto(s_wg_sock, response,
@@ -1240,32 +1478,56 @@ static void wg_recv_task(void *arg)
             int peer_idx = -1;
             uint64_t now_ms;
             tsnode_port_uptime_ms(&now_ms);
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_lock(s_wg_mutex);
+            }
             err = tsnode_wg_consume_response(&s_wg_dev, pkt_buf, nread,
                                               now_ms, &peer_idx);
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_unlock(s_wg_mutex);
+            }
             if (err != TSNODE_OK) {
                 TSNODE_LOGW(TAG, "WG consume_response failed: %d", err);
                 continue;
             }
+            s_wg_hs_attempts[peer_idx] = 0;
             TSNODE_LOGI(TAG, "WG session ESTABLISHED peer=%d t=%lu ms", peer_idx, (unsigned long)ts_rel_ms());
+            /* Primer paquete de transporte autenticado hacia el responder:
+             * confirma la sesión iniciada (WireGuard §5.3 — sin él el peer
+             * no activa la sesión ni envía datos; visto en hardware). */
+            wg_send_keepalive(peer_idx);
             break;
         }
 
         case TSNODE_WG_MSG_TYPE_TRANSPORT_DATA: {
             int peer_idx = -1;
             size_t inner_len = 0;
+            if (s_wg_mutex != NULL) {
+                tsnode_port_mutex_lock(s_wg_mutex);
+            }
             err = tsnode_wg_decap(&s_wg_dev, pkt_buf, nread,
                                    inner_buf, sizeof(inner_buf), &inner_len,
                                    &peer_idx);
             if (err == TSNODE_ERR_REPLAY) {
                 /* Replay duplicate — silently drop */
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 continue;
             }
             if (err != TSNODE_OK) {
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 TSNODE_LOGW(TAG, "WG decap failed: %d", err);
                 continue;
             }
+            s_wg_hs_attempts[peer_idx] = 0;
 
             if (inner_len == 0) {
+                if (s_wg_mutex != NULL) {
+                    tsnode_port_mutex_unlock(s_wg_mutex);
+                }
                 /* Keepalive (empty payload) */
                 s_wg_counters.rx_keepalive++;
                 TSNODE_LOGI(TAG, "WG RX keepalive #%lu peer=%d t=%lu ms",
@@ -1286,6 +1548,9 @@ static void wg_recv_task(void *arg)
                     err = tsnode_wg_encap(&s_wg_dev, peer_idx, inner_buf,
                                           inner_len, now_ms,
                                           reply, sizeof(reply), &reply_len);
+                    if (s_wg_mutex != NULL) {
+                        tsnode_port_mutex_unlock(s_wg_mutex);
+                    }
                     if (err != TSNODE_OK) {
                         TSNODE_LOGW(TAG, "WG ICMP reply encap failed: %d", err);
                     } else {
@@ -1294,12 +1559,16 @@ static void wg_recv_task(void *arg)
                         if (err != TSNODE_OK) {
                             TSNODE_LOGW(TAG, "WG ICMP reply send failed: %d", err);
                         } else {
+                            s_wg_last_tx_ms[peer_idx] = (uint32_t)now_ms;
                             TSNODE_LOGI(TAG, "WG ICMP echo reply #%lu peer=%d %zu bytes t=%lu ms",
                                         (unsigned long)s_wg_counters.rx_transport,
                                         peer_idx, inner_len, (unsigned long)ts_rel_ms());
                         }
                     }
                 } else {
+                    if (s_wg_mutex != NULL) {
+                        tsnode_port_mutex_unlock(s_wg_mutex);
+                    }
                     /* Inner non-ICMP echo packet — log and drop (no TUN) */
                     TSNODE_LOGI(TAG, "WG RX data #%lu peer=%d %zu bytes (no TUN) t=%lu ms",
                                 (unsigned long)s_wg_counters.rx_transport,
@@ -1455,29 +1724,47 @@ static void client_task(void *arg)
 
             if (s_state != TSNODE_CLIENT_ONLINE) break;
 
-            /* Keepalive fallido: el túnel no responde → reconexión. Se cuenta
-             * como error de poll para que entre en el backoff existente. */
+            /* Keepalive fallido: el túnel NO responde — la conexión está
+             * muerta y reintentar es inútil. Reconexión inmediata (el loop
+             * externo usa backoff base 5s, GOAL-6: sin esto la reconexión
+             * tardaba minutos con backoff 60/120/240s sobre conexión muerta). */
             if (keepalive_failed) {
-                poll_consecutive_errors++;
-                poll_interval_s = MAP_POLL_INTERVAL_BASE_S *
-                                  (1 << (poll_consecutive_errors < 5 ? poll_consecutive_errors : 5));
-                if (poll_interval_s > MAP_POLL_INTERVAL_MAX_S) {
-                    poll_interval_s = MAP_POLL_INTERVAL_MAX_S;
-                }
-                TSNODE_LOGW(TAG, "map poll error (keepalive), backoff to %us",
-                            poll_interval_s);
-
-                if (poll_consecutive_errors >= 3) {
-                    TSNODE_LOGE(TAG, "too many map poll errors — "
-                                "dropping connection for reconnect");
-                    break;  /* exit poll loop → outer loop reconnects */
-                }
-                continue;
+                TSNODE_LOGE(TAG, "keepalive failed — dropping connection "
+                            "for reconnect");
+                break;  /* exit poll loop → outer loop reconnects (5s) */
             }
 
             tsnode_map_netmap_t netmap;
             tsnode_err_t poll_err = do_map_poll(&netmap);
             if (poll_err != TSNODE_OK) {
+                /* La conexión TCP se cerró/reseteó (RST/EOF neto): no tiene
+                 * sentido volver a postear sobre el socket muerto. Salir del
+                 * poll loop ahora; el loop externo reconecta en ~5s. */
+                if (poll_err == TSNODE_ERR_NETWORK) {
+                    TSNODE_LOGE(TAG, "map poll connection lost (net) — "
+                                "reconnecting");
+                    break;
+                }
+                /* Long-poll idle: el control plane no envió nada en los
+                 * 300s del techo (normal: no hay cambios de netmap). No es
+                 * un error de red: re-POSTear de inmediato (refresca el
+                 * mapping NAT/firewall, ADR-0009) sin backoff. Hasta 3
+                 * silencios seguidos, luego se reconecta. */
+                if (poll_err == TSNODE_ERR_TIMEOUT) {
+                    poll_consecutive_errors++;
+                    poll_interval_s = 0;   /* re-POST sin dormir */
+                    if (poll_consecutive_errors >= 3) {
+                        TSNODE_LOGE(TAG, "map long-poll idle 3x — "
+                                    "dropping connection for reconnect");
+                        break;
+                    }
+                    TSNODE_LOGW(TAG, "map long-poll idle timeout — "
+                                "re-POSTing (backoff=%us, count=%u)",
+                                poll_interval_s, poll_consecutive_errors);
+                    continue;
+                }
+                /* Otros errores (parse, framing, protocolo sin red rota):
+                 * backoff exponencial existente y reconexión al 3er fallo. */
                 poll_consecutive_errors++;
                 poll_interval_s = MAP_POLL_INTERVAL_BASE_S *
                                   (1 << (poll_consecutive_errors < 5 ? poll_consecutive_errors : 5));
