@@ -105,7 +105,10 @@ check: all
 	./test_icmp_echo
 	./test_disco
 
+# Alias documentado en PROJECT-GOALS.md (métricas de éxito).
+test: check
+
 clean:
 	rm -f $(TESTS)
 
-.PHONY: all check clean
+.PHONY: all check test clean
