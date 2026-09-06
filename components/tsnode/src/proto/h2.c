@@ -448,6 +448,19 @@ tsnode_err_t h2_post(h2_conn_t *h, const char *authority, const char *path,
                      size_t body_len, uint8_t *resp, size_t resp_cap,
                      size_t *resp_len)
 {
+    /* max_silent_pings=0: cualquier timeout de la capa de registros se
+     * propaga como error, exactamente el comportamiento histórico de
+     * h2_post (fail-closed). */
+    return h2_post_keepalive(h, authority, path, lb_value, body, body_len,
+                             resp, resp_cap, resp_len, 0);
+}
+
+tsnode_err_t h2_post_keepalive(h2_conn_t *h, const char *authority,
+                               const char *path, const char *lb_value,
+                               const uint8_t *body, size_t body_len,
+                               uint8_t *resp, size_t resp_cap,
+                               size_t *resp_len, uint32_t max_silent_pings)
+{
     if (h == NULL || !h->started || authority == NULL || path == NULL ||
         body == NULL || resp == NULL || resp_len == NULL) {
         return TSNODE_ERR_INVALID_ARG;
@@ -493,20 +506,41 @@ tsnode_err_t h2_post(h2_conn_t *h, const char *authority, const char *path,
         .done = false,
     };
 
+    /* Keepalive inline durante el long-poll (ADR-0020): un timeout de la
+     * capa de registros (recv timeout configurado por el caller) dispara un
+     * PING fire-and-forget en lugar de fallar, manteniendo así tráfico
+     * saliente regular y el mapping NAT/firewall vivo. Contador de silencio:
+     * si tras max_silent_pings timeouts consecutivos NO llegó ningún frame
+     * (ni ACK a nuestros PINGs, ni DATA, ni SETTINGS), la conexión está
+     * muerta en half-open → NETWORK (fail-closed, detección acotada). Un par
+     * sano ACKea cada PING (RFC 7540 §6.7) y jamás alcanza el límite. */
+    uint32_t silent_pings = 0;
     while (!rc.done) {
         h2_frame_view_t f;
         err = peek_frame(h, &f);
+        if (err == TSNODE_ERR_TIMEOUT) {
+            if (silent_pings >= max_silent_pings) {
+                return TSNODE_ERR_NETWORK;
+            }
+            err = h2_ping_send(h);
+            if (err != TSNODE_OK) return err;
+            silent_pings++;
+            continue;
+        }
         if (err != TSNODE_OK) return err;
         err = handle_frame(h, &f, &rc);
         if (err != TSNODE_OK) return err;
         consume_frame(h, &f);
+        /* Cualquier frame recibido (= algo llegó del par) despeja el
+         * contador de silencio. */
+        silent_pings = 0;
     }
 
     *resp_len = rc.resp_len;
     return TSNODE_OK;
 }
 
-tsnode_err_t h2_ping(h2_conn_t *h)
+tsnode_err_t h2_ping_send(h2_conn_t *h)
 {
     if (h == NULL || !h->started) {
         return TSNODE_ERR_INVALID_ARG;
@@ -521,8 +555,21 @@ tsnode_err_t h2_ping(h2_conn_t *h)
     put_frame_header(hdr, H2_FRAME_PING, 0, 0, 8);
     tsnode_err_t err = send_all(&h->io, hdr, sizeof(hdr));
     if (err != TSNODE_OK) return err;
-    err = send_all(&h->io, payload, sizeof(payload));
+    return send_all(&h->io, payload, sizeof(payload));
+}
+
+tsnode_err_t h2_ping(h2_conn_t *h)
+{
+    if (h == NULL || !h->started) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+
+    tsnode_err_t err = h2_ping_send(h);
     if (err != TSNODE_OK) return err;
+
+    /* Payload para comparar el ACK: el mismo que h2_ping_send acaba de
+     * enviar (payload opaco fijo). */
+    const uint8_t payload[8] = { 0x74, 0x73, 0x6e, 0x6f, 0x64, 0x65, 0x50, 0x31 };
 
     /* Esperar el ACK del par. Los timeouts llegan de la capa de registros
      * (SO_RCVTIMEO del port): no bloquea más que una lectura normal. */

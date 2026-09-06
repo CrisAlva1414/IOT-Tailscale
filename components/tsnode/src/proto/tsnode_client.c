@@ -816,6 +816,18 @@ static tsnode_err_t do_connect(void)
  * que el idle al que el control plane muere (~90s observado en hardware). */
 #define H2_PING_IDLE_S  20
 
+/* Long-poll de /machine/map (ADR-0020): el recv timeout de la capa de
+ * registros durante el long-poll se baja de 300s a H2_LONGPOLL_PING_S, de
+ * modo que cada ese-tantos segundos de silencio h2_post_keepalive envía un
+ * PING fire-and-forget (keepalive inline) manteniendo el mapping
+ * NAT/firewall vivo. Antes el long-poll quedaba >300s sin tráfico saliente
+ * y el binding moría (~90s) → ciclo timeout→re-POST→NETWORK→reconnect. */
+#define H2_LONGPOLL_PING_S            10
+/* Fail-closed: si pasan H2_LONGPOLL_MAX_SILENT_PINGS pings consecutivos sin
+ * recibir NINGÚN frame (ni ACK, ni DATA, ni SETTINGS), la conexión está
+ * muerta en half-open y se reconecta. 10 pings * 10s = detección ≤100s. */
+#define H2_LONGPOLL_MAX_SILENT_PINGS  10
+
 /* WireGuard device and UDP socket for data plane (ADR-0011) */
 static tsnode_wg_device_t s_wg_dev;
 static tsnode_port_udp_socket_t *s_wg_sock;
@@ -1122,16 +1134,18 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
     char lb_value[8 + 64 + 1];
     snprintf(lb_value, sizeof(lb_value), "nodekey:%s", s_node_key_pub_hex);
 
-    /* Long-poll: the server holds /machine/map open for up to ~5 minutes
-     * waiting for state changes.  Increase the per-record recv timeout
-     * from the default 10s to 300s so we don't TIME out during the
-     * server's idle period.  Restore after the POST returns. */
-    ts2021_set_recv_timeout(&s_conn, 300000);
+    /* Long-poll: el server mantiene /machine/map abierto hasta ~5 minutos
+     * esperando cambios de estado. Con ADR-0020 el recv timeout se ajusta a
+     * H2_LONGPOLL_PING_S (10s): h2_post_keepalive envía un PING por cada
+     * silencio de ese tamaño (keepalive inline que mantiene NAT/firewall) y
+     * el long-poll ya no "vence" por idle. Se restaura tras el POST. */
+    ts2021_set_recv_timeout(&s_conn, H2_LONGPOLL_PING_S * 1000u);
 
     size_t map_wire_len;
-    err = h2_post(&s_h2, s_config.control_host, "/machine/map",
-                  lb_value, (const uint8_t *)map_req, map_req_len,
-                  s_map_resp, sizeof(s_map_resp) - 1, &map_wire_len);
+    err = h2_post_keepalive(&s_h2, s_config.control_host, "/machine/map",
+                            lb_value, (const uint8_t *)map_req, map_req_len,
+                            s_map_resp, sizeof(s_map_resp) - 1, &map_wire_len,
+                            H2_LONGPOLL_MAX_SILENT_PINGS);
 
     ts2021_set_recv_timeout(&s_conn, 10000);  /* restore default */
 

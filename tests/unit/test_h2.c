@@ -44,6 +44,11 @@ typedef struct {
     size_t in_total;        /* suma de in_lens */
     size_t in_next;
     size_t in_off;          /* offset dentro de in para el próximo registro */
+    size_t tmo_before;      /* registros a servir antes de la racha de TIMEOUT */
+    size_t tmo_repeats;     /* veces consecutivas que m_recv devuelve TIMEOUT
+                             * (simula idle del long-poll: 0 = nunca) */
+    size_t tmo_left;        /* repeticiones restantes (interno) */
+    bool tmo_armed;         /* la racha ya se activó (interno) */
     uint8_t out[65536];     /* todo lo que el cliente envió */
     size_t out_len;
 } mock_io_t;
@@ -61,6 +66,21 @@ static tsnode_err_t m_recv(void *ctx, uint8_t *buf, size_t cap,
                             size_t *out_len)
 {
     mock_io_t *m = (mock_io_t *)ctx;
+
+    /* Racha de TIMEOUT simulada para h2_post_keepalive: una vez servidos
+     * tmo_before registros, devolver TIMEOUT tmo_repeats veces (sin
+     * consumir nada) y después seguir con los registros restantes. Es el
+     * análogo del SO_RCVTIMEO en el long-poll real. */
+    if (m->tmo_repeats > 0 && !m->tmo_armed && m->in_next >= m->tmo_before) {
+        m->tmo_armed = true;
+        m->tmo_left = m->tmo_repeats;
+    }
+    if (m->tmo_left > 0) {
+        m->tmo_left--;
+        *out_len = 0;
+        return TSNODE_ERR_TIMEOUT;
+    }
+
     if (m->in_next >= m->in_count) {
         *out_len = 0; /* EOF: conexión cerrada por el par */
         return TSNODE_OK;
@@ -673,6 +693,174 @@ static void test_h2_ping_unstarted_fails(void)
     h2_conn_t h;
     memset(&h, 0, sizeof(h));
     CHECK(h2_ping(&h) == TSNODE_ERR_INVALID_ARG);
+    CHECK(h2_ping_send(&h) == TSNODE_ERR_INVALID_ARG);
+}
+
+/* Cuenta frames PING (type 0x6, sin ACK, stream 0, len 8) con el payload
+ * del keepalive dentro de lo que el cliente envió. */
+static size_t count_ping_frames(const mock_io_t *m)
+{
+    size_t found = 0;
+    for (size_t i = 0; i + 17 <= m->out_len; i++) {
+        if (m->out[i] == 0x00 && m->out[i + 1] == 0x00 && m->out[i + 2] == 0x08 &&
+            m->out[i + 3] == 0x06 && m->out[i + 4] == 0x00 &&
+            m->out[i + 5] == 0x00 && m->out[i + 6] == 0x00 &&
+            m->out[i + 7] == 0x00 && m->out[i + 8] == 0x00 &&
+            memcmp(m->out + i + 9, PING_KEEPALIVE_PAYLOAD, 8) == 0) {
+            found++;
+        }
+    }
+    return found;
+}
+
+static void test_h2_post_keepalive_survives_timeouts(void)
+{
+    /* Long-poll sano (ADR-0020): SETTINGS, luego 3 silencios de recv
+     * timeout (el server tarda en contestar), el server ACKea nuestro PING
+     * y finalmente responde la respuesta del map. El keepalive inline debe
+     * mantener el POST vivo y devolver la respuesta completa. */
+    static uint8_t inbuf[256];
+    static size_t lens[8];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x6, 0x1 /* ACK a nuestro PING */, 0,
+                    PING_KEEPALIVE_PAYLOAD, 8);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    uint8_t status[1] = {H2_HPACK_STATUS_200};
+    flen = mk_frame(f, 0x1, 0x4 /* END_HEADERS */, 1, status, 1);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    const char *body = "{\"KeepAlive\":true}";
+    flen = mk_frame(f, 0x0, 0x1 /* END_STREAM */, 1,
+                    (const uint8_t *)body, (uint32_t)strlen(body));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+    m.tmo_before = 1;   /* tras el SETTINGS... */
+    m.tmo_repeats = 3;  /* ...3 timeouts (idle del long-poll)... */
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    CHECK(h2_post_keepalive(&h, "controlplane.tailscale.com", "/machine/map",
+                            NULL, (const uint8_t *)"{}", 2, resp,
+                            sizeof(resp) - 1, &resp_len, 10) == TSNODE_OK);
+    resp[resp_len] = '\0';
+    CHECK(strcmp((char *)resp, body) == 0);
+    /* Un PING por cada timeout de la racha. */
+    CHECK(count_ping_frames(&m) == 3);
+}
+
+static void test_h2_post_keepalive_fails_closed_after_silent_pings(void)
+{
+    /* Half-open muerto: el server dejó de contestar del todo. Tras
+     * max_silent_pings PINGs sin recibir NINGÚN frame, el POST debe
+     * abortar con NETWORK (fail-closed, detección acotada), no colgarse
+     * ni seguir mandando pings al vacío indefinidamente. */
+    static uint8_t inbuf[256];
+    static size_t lens[8];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x1, 0x4, 1, (const uint8_t[]){H2_HPACK_STATUS_200}, 1);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x0, 0x1, 1, (const uint8_t *)"{}", 2);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+    m.tmo_before = 1;
+    m.tmo_repeats = 10; /* silencio total */
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    /* max_silent_pings=3: debe cortar tras 3 pings, justo antes del 4to
+     * timeout, aunque el mock tenga 10 timeouts disponibles. */
+    CHECK(h2_post_keepalive(&h, "controlplane.tailscale.com", "/machine/map",
+                            NULL, (const uint8_t *)"{}", 2, resp,
+                            sizeof(resp) - 1, &resp_len,
+                            3) == TSNODE_ERR_NETWORK);
+    CHECK(count_ping_frames(&m) == 3);
+}
+
+static void test_h2_post_timeout_still_fails_closed(void)
+{
+    /* Regresión: h2_post histórico (max_silent_pings=0) sigue fail-closed
+     * ante un timeout de la capa de registros — no envía PINGs. */
+    static uint8_t inbuf[256];
+    static size_t lens[8];
+    uint8_t f[64];
+    size_t off = 0, count = 0;
+
+    size_t flen = mk_frame(f, 0x4, 0x0, 0, PROD_SETTINGS_PAYLOAD,
+                           sizeof(PROD_SETTINGS_PAYLOAD));
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    flen = mk_frame(f, 0x1, 0x4, 1, (const uint8_t[]){H2_HPACK_STATUS_200}, 1);
+    memcpy(inbuf + off, f, flen);
+    lens[count++] = flen;
+    off += flen;
+
+    mock_io_t m;
+    memset(&m, 0, sizeof(m));
+    m.in = inbuf;
+    m.in_lens = lens;
+    m.in_count = count;
+    m.tmo_before = 1;
+    m.tmo_repeats = 5;
+
+    h2_conn_t h;
+    h2_io_t io = { .ctx = &m, .send_bytes = m_send, .recv_record = m_recv };
+    CHECK(h2_client_start(&h, &io) == TSNODE_OK);
+
+    uint8_t resp[64];
+    size_t resp_len = 0;
+    CHECK(h2_post(&h, "controlplane.tailscale.com", "/machine/map", NULL,
+                  (const uint8_t *)"{}", 2, resp, sizeof(resp) - 1,
+                  &resp_len) == TSNODE_ERR_NETWORK);
+    /* Sin keepalive: cero PINGs. */
+    CHECK(count_ping_frames(&m) == 0);
 }
 
 static void test_unknown_frame_type_fails_closed(void)
@@ -1065,6 +1253,9 @@ int main(void)
     RUN(test_h2_ping_server_ping_ponged);
     RUN(test_h2_ping_eof_fails);
     RUN(test_h2_ping_unstarted_fails);
+    RUN(test_h2_post_keepalive_survives_timeouts);
+    RUN(test_h2_post_keepalive_fails_closed_after_silent_pings);
+    RUN(test_h2_post_timeout_still_fails_closed);
     RUN(test_unknown_frame_type_fails_closed);
     RUN(test_response_overflow_fails);
     RUN(test_eof_mid_stream_fails);

@@ -92,18 +92,43 @@ tsnode_err_t h2_post(h2_conn_t *h, const char *authority, const char *path,
                      uint8_t *resp, size_t resp_cap, size_t *resp_len);
 
 /*
- * Envía un PING keepalive (frame PING, stream 0) y espera el ACK del par
- * con el mismo payload opaco de 8 bytes. Retorna TSNODE_OK al recibir el
- * ACK; en cualquier otro frame/error se propaga el error de la capa
- * inferior (NETWORK por EOF/GOAWAY/fallo de escritura, TIMEOUT si el par
- * no responde dentro del timeout de la capa de registros).
+ * PING keepalive (frame PING, stream 0) con payload opaco fijo de 8 bytes.
+ * Propósito (ADR-0009/ADR-0020): mantener viva la conexión HTTP/2/Noise/TCP
+ * contra el control plane. El PING viaja como frame h2 dentro del túnel
+ * cifrado y refresca el mapping NAT/firewall que de otro modo derriba la
+ * conexión tras ~90s de idle.
  *
- * Propósito (ADR-0009): mantener viva la conexión HTTP/2/Noise/TCP contra
- * el control plane entre polls de map. El PING viaja como frame h2 dentro
- * del túnel cifrado y refresca el mapping NAT/firewall que de otro modo
- * derriba la conexión tras ~90s de idle (GOAL-6).
+ * h2_ping_send(): envía el frame PING y retorna — no espera el ACK. Útil para
+ * keepalive inline dentro de un long-poll (ADR-0020), donde el loop de
+ * recepción consume el ACK del par como un frame normal.
+ *
+ * h2_ping(): envía el frame y espera el ACK con el mismo payload. Retorna
+ * TSNODE_OK al recibir el ACK; en cualquier otro frame/error se propaga el
+ * error de la capa inferior (NETWORK por EOF/GOAWAY/fallo de escritura,
+ * TIMEOUT si el par no responde dentro del timeout de la capa de registros).
  */
+tsnode_err_t h2_ping_send(h2_conn_t *h);
 tsnode_err_t h2_ping(h2_conn_t *h);
+
+/*
+ * POST igual a h2_post() pero con keepalive inline durante el long-poll
+ * (ADR-0020): si el recv de la capa de registros devuelve TSNODE_ERR_TIMEOUT
+ * (idle mayor al recv timeout que el CALLER configuró vía la capa inferior),
+ * se envía un PING fire-and-forget y se continúa esperando la respuesta, en
+ * vez de fallar. Así el long-poll de /machine/map nunca queda en silencio de
+ * salida (NAT/firewall) por más de max_silent_pings pings.
+ *
+ * max_silent_pings: si el par no recibe NINGÚN frame (ni DATA, ni ACK a
+ * nuestros PINGs, ni SETTINGS) durante max_silent_pings timeouts consecutivos,
+ * la conexión se considera muerta en half-open y se retorna
+ * TSNODE_ERR_NETWORK (fail-closed, detección acotada). Un par sano ACKea cada
+ * PING (RFC 7540 §6.7) y jamás alcanza el límite.
+ */
+tsnode_err_t h2_post_keepalive(h2_conn_t *h, const char *authority,
+                               const char *path, const char *lb_value,
+                               const uint8_t *body, size_t body_len,
+                               uint8_t *resp, size_t resp_cap,
+                               size_t *resp_len, uint32_t max_silent_pings);
 
 /* Solo para tests: codifica el bloque HPACK del request. Orden fijo:
  * :method POST, :scheme https, :authority, :path, [ts-lb], content-type.
