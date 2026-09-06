@@ -1,7 +1,8 @@
 /*
- * Cliente Tailscale: ciclo de vida completo (ADR-0008).
+ * Cliente Tailscale: ciclo de vida completo (ADR-0008, ADR-0021).
  *
- * Orquesta: fetch control key → Noise handshake → register → map poll.
+ * Orquesta: fetch control key → Noise handshake → register (una sola vez,
+ * ADR-0021) → stream de /machine/map long-lived con deltas.
  * Ejecuta como tarea FreeRTOS dedicada.
  */
 
@@ -59,15 +60,23 @@ static void wg_log_counters(void)
 
 /* Persistencia de identidad (ADR-0003): machine key + node key vía el KV
  * del port (NVS en ESP-IDF). En banco de pruebas sin flash encryption los
- * blobs están en claro — aceptado solo para desarrollo (ADR-0003). */
+ * blobs están en claro — aceptado solo para desarrollo (ADR-0003).
+ *
+ * regdone (ADR-0021): el nodo completó POST /machine/register al menos una
+ * vez. Sin este flag no se puede saltear el registro (una identidad
+ * generada pero jamás registrada no sirve). */
 #define TS_ID_NVS_NAMESPACE "tsnode"
 static const char *TS_ID_KEY_MACH = "machkey";
 static const char *TS_ID_KEY_NODE = "nodekey";
+static const char *TS_ID_KEY_DONE = "regdone";
 
 /* Carga la identidad persistida. Si solo uno de los dos blobs es válido,
- * se descartan ambos para no mezclar identidades parciales. */
-static bool load_identity(uint8_t mach[32], uint8_t node[32])
+ * se descartan ambos para no mezclar identidades parciales. *registered
+ * opcional: true si el flag regdone está presente y vale 1. */
+static bool load_identity(uint8_t mach[32], uint8_t node[32],
+                          bool *registered)
 {
+    if (registered != NULL) *registered = false;
     bool ok_mach = tsnode_port_kv_get(TS_ID_NVS_NAMESPACE, TS_ID_KEY_MACH,
                                       mach, 32);
     bool ok_node = tsnode_port_kv_get(TS_ID_NVS_NAMESPACE, TS_ID_KEY_NODE,
@@ -76,6 +85,11 @@ static bool load_identity(uint8_t mach[32], uint8_t node[32])
         memset(mach, 0, 32);
         memset(node, 0, 32);
         return false;
+    }
+    if (ok_mach && registered != NULL) {
+        uint8_t flag = 0;
+        *registered = tsnode_port_kv_get(TS_ID_NVS_NAMESPACE, TS_ID_KEY_DONE,
+                                         &flag, 1) && flag == 1;
     }
     return ok_mach && ok_node && mach[0] != 0 && node[0] != 0;
 }
@@ -93,10 +107,20 @@ static void save_identity(const uint8_t mach[32], const uint8_t node[32])
     }
 }
 
+/* Marca que el nodo ya se registró (llamar SOLO tras register exitoso). */
+static void mark_registered(void)
+{
+    uint8_t flag = 1;
+    if (!tsnode_port_kv_set(TS_ID_NVS_NAMESPACE, TS_ID_KEY_DONE, &flag, 1)) {
+        TSNODE_LOGW(TAG, "registration flag persist failed");
+    }
+}
+
 void tsnode_client_forget_identity(void)
 {
     tsnode_port_kv_del(TS_ID_NVS_NAMESPACE, TS_ID_KEY_MACH);
     tsnode_port_kv_del(TS_ID_NVS_NAMESPACE, TS_ID_KEY_NODE);
+    tsnode_port_kv_del(TS_ID_NVS_NAMESPACE, TS_ID_KEY_DONE);
     TSNODE_LOGI(TAG, "identity erased from NVS");
 }
 
@@ -106,9 +130,6 @@ void tsnode_client_forget_identity(void)
  * ronda 600 B; 4 KiB es margen holgado (ADR-0009 D3). */
 #define REGISTER_RESPONSE_BUF_SIZE 4096
 #define MAP_REQUEST_BUF_SIZE 1024
-/* MapResponse observado ~17 KB con tailnet chica; 32 KiB estático cubre
- * crecimiento moderado de peers sin heap (ADR-0009 D3). */
-#define MAP_RESPONSE_BUF_SIZE 32768
 
 static tsnode_client_state_t s_state = TSNODE_CLIENT_IDLE;
 static tsnode_client_config_t s_config;
@@ -127,7 +148,14 @@ static h2_conn_t s_h2;
 /* Buffers grandes fuera del stack: la tarea corre con 40 KB y el pico de
  * crypto (mbedTLS) ya usa buena parte; 32 KB en stack es crash seguro. */
 static uint8_t s_reg_resp[REGISTER_RESPONSE_BUF_SIZE];
-static uint8_t s_map_resp[MAP_RESPONSE_BUF_SIZE];
+
+/* Estado del stream de /machine/map (ADR-0021): el splitter de mensajes
+ * (con su buffer de 32 KiB) y el netmap vivo que se va actualizando por
+ * deltas. Viven estáticos: el callback de DATA del h2 los toca en contexto
+ * de la tarea del cliente — sin stack de por medio. */
+static tsnode_map_stream_t s_map_stream;
+static tsnode_map_netmap_t s_netmap;
+static bool s_stream_has_full = false;
 
 /* ---- Timestamp helper for packet logging ---- */
 static uint64_t s_start_ms = 0;
@@ -355,10 +383,12 @@ static tsnode_err_t do_connect(void)
 
     /* Step 2: identidad — NVS primero (ADR-0003); si no existe, generar y
      * persistir. Con identidad persistida el nodo registrado es SIEMPRE el
-     * mismo: la aprobación de device sobrevive reinicios. */
+     * mismo: la aprobación de device sobrevive reinicios. regdone dice si
+     * esa identidad YA completó el registro (ADR-0021). */
     uint8_t loaded_mach[32] = {0};
     uint8_t loaded_node[32] = {0};
-    if (load_identity(loaded_mach, loaded_node)) {
+    bool regdone = false;
+    if (load_identity(loaded_mach, loaded_node, &regdone)) {
         memcpy(s_config.machine_key_priv, loaded_mach, 32);
         memcpy(s_node_key, loaded_node, 32);
         if (tsnode_x25519_publickey(s_node_key, s_node_key_pub) != 0) {
@@ -679,8 +709,18 @@ static tsnode_err_t do_connect(void)
     TSNODE_LOGI(TAG, "http2 over noise OK");
 
     /* Step 8: Register via POST /machine/register (h2). El header Ts-Lb
-     * lleva nuestra node key pública (control/tsp/register.go). */
-    set_state(TSNODE_CLIENT_REGISTERING);
+     * lleva nuestra node key pública (control/tsp/register.go).
+     *
+     * SOLO si la identidad nunca completó el registro (ADR-0021): una vez
+     * registrado, el nodo se autentica con su node key, y re-registrar con
+     * otra auth key consumiría una key de un solo uso sin necesidad. */
+    if (!regdone) {
+        if (s_config.auth_key == NULL) {
+            TSNODE_LOGE(TAG, "no auth key and no registered identity: "
+                        "provision first (tskey set)");
+            return TSNODE_ERR_PROVISIONING;
+        }
+        set_state(TSNODE_CLIENT_REGISTERING);
     char reg_req[REGISTER_BUF_SIZE];
     size_t reg_len;
     err = tsnode_register_build_request(reg_req, sizeof(reg_req), &reg_len,
@@ -748,80 +788,27 @@ static tsnode_err_t do_connect(void)
         TSNODE_LOGW(TAG, "machine not yet authorized (device approval)");
     }
     TSNODE_LOGI(TAG, "registration done");
+        mark_registered();
+    } else {
+        TSNODE_LOGI(TAG, "already registered — skipping register "
+                    "(identity from NVS)");
+    }
 
-    /* Step 9: Map sync via POST /machine/map (h2). */
+    /* Step 9: la sincronización de netmap la hace do_map_stream()
+     * (ADR-0021): el primer mensaje del stream de /machine/map es el
+     * netmap completo y recién ahí el estado pasa a ONLINE. */
     set_state(TSNODE_CLIENT_MAP_SYNC);
-    const uint8_t *dk = tsnode_disco_get_pubkey(&s_disco);
-    uint8_t zero_disco[32] = {0};
-    char map_req[MAP_REQUEST_BUF_SIZE];
-    size_t map_req_len;
-    err = tsnode_map_build_request(map_req, sizeof(map_req), &map_req_len,
-                                    s_node_key_pub,
-                                    dk ? dk : zero_disco,
-                                    s_config.hostname,
-                                    145, false,
-                                    s_config.endpoint_ip,
-                                    s_config.endpoint_port);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "build MapRequest failed: %d", err);
-        return err;
-    }
-
-    size_t map_wire_len;
-    err = h2_post(&s_h2, s_config.control_host, "/machine/map",
-                  lb_value, (const uint8_t *)map_req, map_req_len,
-                  s_map_resp, sizeof(s_map_resp) - 1, &map_wire_len);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "map POST failed: %d", err);
-        return err;
-    }
-    s_map_resp[map_wire_len] = '\0';
-    TSNODE_LOGI(TAG, "MapResponse (%zu bytes wire)", map_wire_len);
-
-    const uint8_t *map_json = NULL;
-    size_t map_json_len = 0;
-    err = tsnode_map_parse_framed(s_map_resp, map_wire_len,
-                                   &map_json, &map_json_len);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "parse MapResponse framing failed: %d", err);
-        return err;
-    }
-
-    tsnode_map_netmap_t netmap;
-    err = tsnode_map_parse_response(&netmap, (const char *)map_json,
-                                     map_json_len);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "parse MapResponse failed: %d", err);
-        return err;
-    }
-
-    TSNODE_LOGI(TAG, "netmap: %u peers, self=%s",
-                netmap.peer_count, netmap.self_ip);
-
-    set_state(TSNODE_CLIENT_ONLINE);
     return TSNODE_OK;
 }
 
-/* ---- Map polling loop ---- */
+/* ---- Map streaming (ADR-0021) ---- */
 
-/* Intervalo base para MapRequest poll (segundos). Backoff exponencial
- * con jitter se aplica en caso de error (ADR-0008 D3). */
-#define MAP_POLL_INTERVAL_BASE_S  30
-#define MAP_POLL_INTERVAL_MAX_S   300
-#define MAP_POLL_JITTER_PCT       20  /* ±20% jitter */
-
-/* Cada cuántos segundos de idle en el túnel HTTP/2/Noise/TCP se envía un
- * PING keepalive (h2_ping) para que NAT/firewall no derriben la conexión
- * entre polls de map (GOAL-6, ADR-0009 D1). Debe ser sensiblemente menor
- * que el idle al que el control plane muere (~90s observado en hardware). */
-#define H2_PING_IDLE_S  20
-
-/* Long-poll de /machine/map (ADR-0020): el recv timeout de la capa de
- * registros durante el long-poll se baja de 300s a H2_LONGPOLL_PING_S, de
- * modo que cada ese-tantos segundos de silencio h2_post_keepalive envía un
- * PING fire-and-forget (keepalive inline) manteniendo el mapping
- * NAT/firewall vivo. Antes el long-poll quedaba >300s sin tráfico saliente
- * y el binding moría (~90s) → ciclo timeout→re-POST→NETWORK→reconnect. */
+/* Stream de /machine/map: el recv timeout de la capa de registros durante
+ * el stream se baja de 300s a H2_LONGPOLL_PING_S, de modo que cada
+ * ese-tantos segundos de silencio h2_post_stream envía un PING
+ * fire-and-forget (keepalive inline, ADR-0020) manteniendo el mapping
+ * NAT/firewall vivo. Antes el long-poll/poll quedaba >300s sin tráfico
+ * saliente y el binding moría (~90s) → ciclo timeout→re-POST→NETWORK. */
 #define H2_LONGPOLL_PING_S            10
 /* Fail-closed: si pasan H2_LONGPOLL_MAX_SILENT_PINGS pings consecutivos sin
  * recibir NINGÚN frame (ni ACK, ni DATA, ni SETTINGS), la conexión está
@@ -1106,14 +1093,136 @@ static void apply_stun_endpoint_to_config(void)
     }
 }
 
-static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
+/* Remueve un peer del data plane (WG + disco + endpoint lógico) cuando el
+ * control plane lo saca de la tailnet (PeersRemoved, ADR-0021).
+ *
+ * Los índices WG NO se reordenan (tsnode_wg_peer_remove hace wipe del
+ * slot): los arrays endpoint lógicos están alineados por slot y un shift
+ * los desincronizaría. disco sí usa shift compacto (busca por clave, no
+ * por slot) — indistinto desde acá. Idempotente: peer ausente = no-op. */
+static tsnode_err_t drop_data_plane_peer(const uint8_t key[32])
+{
+    if (key == NULL) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+    int idx = find_peer_by_key(key);
+    if (idx < 0) {
+        return TSNODE_OK;  /* el peer ya no estaba en WG */
+    }
+
+    tsnode_wg_peer_remove(&s_wg_dev, key);
+    s_wg_ep_ip[idx] = 0;
+    s_wg_ep_port[idx] = 0;
+    s_wg_hs_attempts[idx] = 0;
+    if (s_disco_initialized) {
+        tsnode_disco_remove_peer(&s_disco, key);
+    }
+    TSNODE_LOGI(TAG, "peer left tailnet — removed from data plane (wg idx=%d)",
+                idx);
+    return TSNODE_OK;
+}
+
+/* Aplica UN mensaje de MapResponse (netmap, delta o keepalive) al netmap
+ * vivo y al data plane (ADR-0021). El primer netmap full es el que lleva
+ * al estado ONLINE (reemplaza al viejo map sync post-register). */
+static tsnode_err_t map_stream_handle_message(const uint8_t *json,
+                                               size_t json_len)
+{
+    bool is_full = false;
+    bool peers_updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+
+    tsnode_err_t err = tsnode_map_apply_response(&s_netmap,
+                            (const char *)json, json_len,
+                            &is_full, &peers_updated, removed, &n_removed);
+    if (err != TSNODE_OK) {
+        TSNODE_LOGE(TAG, "apply MapResponse failed: %d", err);
+        return err;
+    }
+
+    if (is_full) {
+        if (!s_stream_has_full) {
+            s_stream_has_full = true;
+            TSNODE_LOGI(TAG, "netmap (stream): %u peers, self=%s",
+                        s_netmap.peer_count, s_netmap.self_ip);
+            /* Solo acá (o en un resync posterior) se re-aplica el data
+             * plane completo; los PeersRemoved llegan por separado. */
+            set_state(TSNODE_CLIENT_ONLINE);
+            peers_updated = (s_netmap.peer_count > 0);
+        } else {
+            TSNODE_LOGI(TAG, "netmap resync (stream): %u peers",
+                        s_netmap.peer_count);
+            peers_updated = true;
+        }
+    }
+
+    if (peers_updated) {
+        for (int i = 0; i < n_removed; i++) {
+            drop_data_plane_peer(removed[i]);
+        }
+        tsnode_err_t wg_err = update_wg_peers(&s_netmap);
+        if (wg_err != TSNODE_OK) {
+            TSNODE_LOGW(TAG, "WG peer update failed: %d", wg_err);
+        }
+    }
+
+    /* Disco housekeeping: timers internos de disco no se disparan solos;
+     * cada mensaje del stream (o cada full) corre el poll. Los keepalives
+     * del control plane (~1/min) mantienen la cadencia mínima. */
+    if (s_disco_initialized) {
+        uint32_t stun_ip = s_netmap.stun.valid ? s_netmap.stun.ip : 0;
+        uint16_t stun_port = s_netmap.stun.valid ? s_netmap.stun.port : 0;
+        tsnode_disco_poll(&s_disco, stun_ip, stun_port, s_wg_sock,
+                          tsnode_wg_crypto_mbedtls());
+    }
+
+    return TSNODE_OK;
+}
+
+/* Callback de DATA del h2 durante el stream (ADR-0021): alimenta el
+ * splitter de mensajes y procesa cada mensaje completo que va saliendo.
+ * Se cierra fail-closed ante framing inválido (ver tsnode_map_stream_next). */
+static tsnode_err_t map_stream_on_data(const uint8_t *data, size_t len,
+                                       void *ctx)
+{
+    (void)ctx;
+    tsnode_err_t err = tsnode_map_stream_feed(&s_map_stream, data, len);
+    if (err != TSNODE_OK) {
+        TSNODE_LOGE(TAG, "stream feed failed: %d", err);
+        return err;
+    }
+    for (;;) {
+        const uint8_t *msg = NULL;
+        size_t msg_len = 0;
+        bool has = false;
+        err = tsnode_map_stream_next(&s_map_stream, &msg, &msg_len, &has);
+        if (err != TSNODE_OK) {
+            TSNODE_LOGE(TAG, "stream framing error: %d", err);
+            return err;
+        }
+        if (!has) {
+            break;
+        }
+        err = map_stream_handle_message(msg, msg_len);
+        if (err != TSNODE_OK) {
+            return err;
+        }
+    }
+    return TSNODE_OK;
+}
+
+/* Stream de /machine/map (ADR-0021). No retorna hasta que el server cierra
+ * el stream (o la conexión muere): los estados ONLINE / netmap / data plane
+ * se van aplicando desde el callback. */
+static tsnode_err_t do_map_stream(void)
 {
     tsnode_err_t err;
 
-    /* Use STUN-discovered public endpoint if available (GOAL-3) */
+    /* Endpoint STUN público si ya está descubierto (GOAL-3). */
     apply_stun_endpoint_to_config();
 
-    /* Build MapRequest */
+    /* Build MapRequest con Stream:true (KeepAlive via tsnode_map) */
     const uint8_t *disco_key = tsnode_disco_get_pubkey(&s_disco);
     uint8_t zero_disco[32] = {0};
     char map_req[MAP_REQUEST_BUF_SIZE];
@@ -1122,7 +1231,8 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
                                     s_node_key_pub,
                                     disco_key ? disco_key : zero_disco,
                                     s_config.hostname,
-                                    145, false,
+                                    145, /* CurrentCapabilityVersion */
+                                    true, /* stream */
                                     s_config.endpoint_ip,
                                     s_config.endpoint_port);
     if (err != TSNODE_OK) {
@@ -1130,84 +1240,31 @@ static tsnode_err_t do_map_poll(tsnode_map_netmap_t *netmap)
         return err;
     }
 
-    /* POST /machine/map via h2 */
     char lb_value[8 + 64 + 1];
     snprintf(lb_value, sizeof(lb_value), "nodekey:%s", s_node_key_pub_hex);
 
-    /* Long-poll: el server mantiene /machine/map abierto hasta ~5 minutos
-     * esperando cambios de estado. Con ADR-0020 el recv timeout se ajusta a
-     * H2_LONGPOLL_PING_S (10s): h2_post_keepalive envía un PING por cada
-     * silencio de ese tamaño (keepalive inline que mantiene NAT/firewall) y
-     * el long-poll ya no "vence" por idle. Se restaura tras el POST. */
+    /* Stream nuevo: splitter y netmap parten limpios. En el primer mensaje
+     * (full) el handler marca ONLINE. */
+    tsnode_map_stream_init(&s_map_stream);
+    s_stream_has_full = false;
+
+    /* Recv timeout corto durante el stream: cada timeout dispara un PING
+     * fire-and-forget (ADR-0020) que mantiene NAT/firewall sin morirse. */
     ts2021_set_recv_timeout(&s_conn, H2_LONGPOLL_PING_S * 1000u);
 
-    size_t map_wire_len;
-    err = h2_post_keepalive(&s_h2, s_config.control_host, "/machine/map",
-                            lb_value, (const uint8_t *)map_req, map_req_len,
-                            s_map_resp, sizeof(s_map_resp) - 1, &map_wire_len,
-                            H2_LONGPOLL_MAX_SILENT_PINGS);
+    err = h2_post_stream(&s_h2, s_config.control_host, "/machine/map",
+                         lb_value, (const uint8_t *)map_req, map_req_len,
+                         map_stream_on_data, NULL,
+                         H2_LONGPOLL_MAX_SILENT_PINGS);
 
     ts2021_set_recv_timeout(&s_conn, 10000);  /* restore default */
 
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "map POST failed: %d", err);
-        return err;
+    if (err == TSNODE_OK) {
+        TSNODE_LOGI(TAG, "map stream ended cleanly (server closed)");
+    } else {
+        TSNODE_LOGE(TAG, "map stream error: %d", err);
     }
-    s_map_resp[map_wire_len] = '\0';
-    TSNODE_LOGI(TAG, "MapResponse poll (%zu bytes wire)", map_wire_len);
-
-    /* Parse framing + JSON */
-    const uint8_t *map_json = NULL;
-    size_t map_json_len = 0;
-    err = tsnode_map_parse_framed(s_map_resp, map_wire_len,
-                                   &map_json, &map_json_len);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "parse MapResponse framing failed: %d", err);
-        return err;
-    }
-
-    err = tsnode_map_parse_response(netmap, (const char *)map_json,
-                                     map_json_len);
-    if (err != TSNODE_OK) {
-        TSNODE_LOGE(TAG, "parse MapResponse failed: %d", err);
-        return err;
-    }
-
-    /* Debug: dump JSON in chunks */
-    size_t chunk_size = 150;
-    for (size_t offset = 0; offset < map_json_len; offset += chunk_size) {
-        size_t len = map_json_len - offset;
-        if (len > chunk_size) len = chunk_size;
-        TSNODE_LOGI(TAG, "JSON[%zu]: %.*s", offset, (int)len, map_json + offset);
-    }
-
-    TSNODE_LOGI(TAG, "netmap poll: %u peers, self=%s",
-                netmap->peer_count, netmap->self_ip);
-
-    /* Debug: log self node key */
-    char self_hex[65];
-    for (int i = 0; i < 32; i++) {
-        snprintf(self_hex + i * 2, 3, "%02x", netmap->self_node_key[i]);
-    }
-    TSNODE_LOGI(TAG, "self key: %s", self_hex);
-
-    /* Log first peer details if any */
-    if (netmap->peer_count > 0) {
-        for (uint8_t i = 0; i < netmap->peer_count && i < 3; i++) {
-            const tsnode_map_peer_t *p = &netmap->peers[i];
-            bool has_dk = false;
-            for (int k = 0; k < 32; k++) {
-                if (p->disco_key[k] != 0) { has_dk = true; break; }
-            }
-            TSNODE_LOGI(TAG, "peer[%d]: ip=%s ep=%s:%u disco=%s",
-                        i, p->tailscale_ip,
-                        p->n_endpoints > 0 ? p->endpoints[0].ip : "-",
-                        p->n_endpoints > 0 ? p->endpoints[0].port : 0,
-                        has_dk ? "yes" : "no");
-        }
-    }
-
-    return TSNODE_OK;
+    return err;
 }
 
 /* ---- WireGuard UDP receive task (ADR-0011) ---- */
@@ -1683,8 +1740,8 @@ static void client_task(void *arg)
             continue;
         }
 
-        /* ---- Connected: enter polling loop ---- */
-        TSNODE_LOGI(TAG, "connected — entering poll loop");
+        /* ---- Connected: enter map streaming (ADR-0021) ---- */
+        TSNODE_LOGI(TAG, "connected — entering map streaming");
         consecutive_errors = 0;
         reconnect_backoff_s = 0;
 
@@ -1696,127 +1753,20 @@ static void client_task(void *arg)
             /* Non-fatal: data plane won't work but control plane is fine */
         }
 
-        uint32_t poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
-        uint32_t poll_consecutive_errors = 0;
-
-        while (s_state == TSNODE_CLIENT_ONLINE) {
-            /* Sleep with jitter */
-            uint32_t jitter = (poll_interval_s * MAP_POLL_JITTER_PCT) / 100;
-            uint32_t sleep_s = poll_interval_s;
-            if (jitter > 0) {
-                uint64_t uptime_ms;
-                tsnode_port_uptime_ms(&uptime_ms);
-                uint32_t tick = (uint32_t)(uptime_ms / 1000);
-                if ((tick % 100) < 50) {
-                    sleep_s += (tick % jitter);
-                } else {
-                    sleep_s -= (tick % jitter);
-                }
-            }
-            /* Sleep in 1-second chunks so tsnode_client_stop() is responsive.
-             * Cada H2_PING_IDLE_S de idle se envía un PING HTTP/2 por el
-             * túnel para refrescar el mapping NAT/firewall del control plane
-             * (GOAL-6): sin tráfico, la conexión muere a ~90s y el nodo
-             * cicla 90s online / 5s reconectando. */
-            bool keepalive_failed = false;
-            uint32_t idle_s = 0;
-            for (uint32_t i = 0; i < sleep_s; i++) {
-                if (s_state != TSNODE_CLIENT_ONLINE) break;
-                tsnode_port_delay_ms(1000);
-                idle_s++;
-                if (idle_s >= H2_PING_IDLE_S) {
-                    idle_s = 0;
-                    tsnode_err_t perr = h2_ping(&s_h2);
-                    if (perr != TSNODE_OK) {
-                        TSNODE_LOGW(TAG, "h2 keepalive ping failed: %d — "
-                                    "dropping for reconnect", perr);
-                        keepalive_failed = true;
-                        break;
-                    }
-                }
-            }
-
-            if (s_state != TSNODE_CLIENT_ONLINE) break;
-
-            /* Keepalive fallido: el túnel NO responde — la conexión está
-             * muerta y reintentar es inútil. Reconexión inmediata (el loop
-             * externo usa backoff base 5s, GOAL-6: sin esto la reconexión
-             * tardaba minutos con backoff 60/120/240s sobre conexión muerta). */
-            if (keepalive_failed) {
-                TSNODE_LOGE(TAG, "keepalive failed — dropping connection "
-                            "for reconnect");
-                break;  /* exit poll loop → outer loop reconnects (5s) */
-            }
-
-            tsnode_map_netmap_t netmap;
-            tsnode_err_t poll_err = do_map_poll(&netmap);
-            if (poll_err != TSNODE_OK) {
-                /* La conexión TCP se cerró/reseteó (RST/EOF neto): no tiene
-                 * sentido volver a postear sobre el socket muerto. Salir del
-                 * poll loop ahora; el loop externo reconecta en ~5s. */
-                if (poll_err == TSNODE_ERR_NETWORK) {
-                    TSNODE_LOGE(TAG, "map poll connection lost (net) — "
-                                "reconnecting");
-                    break;
-                }
-                /* Long-poll idle: el control plane no envió nada en los
-                 * 300s del techo (normal: no hay cambios de netmap). No es
-                 * un error de red: re-POSTear de inmediato (refresca el
-                 * mapping NAT/firewall, ADR-0009) sin backoff. Hasta 3
-                 * silencios seguidos, luego se reconecta. */
-                if (poll_err == TSNODE_ERR_TIMEOUT) {
-                    poll_consecutive_errors++;
-                    poll_interval_s = 0;   /* re-POST sin dormir */
-                    if (poll_consecutive_errors >= 3) {
-                        TSNODE_LOGE(TAG, "map long-poll idle 3x — "
-                                    "dropping connection for reconnect");
-                        break;
-                    }
-                    TSNODE_LOGW(TAG, "map long-poll idle timeout — "
-                                "re-POSTing (backoff=%us, count=%u)",
-                                poll_interval_s, poll_consecutive_errors);
-                    continue;
-                }
-                /* Otros errores (parse, framing, protocolo sin red rota):
-                 * backoff exponencial existente y reconexión al 3er fallo. */
-                poll_consecutive_errors++;
-                poll_interval_s = MAP_POLL_INTERVAL_BASE_S *
-                                  (1 << (poll_consecutive_errors < 5 ? poll_consecutive_errors : 5));
-                if (poll_interval_s > MAP_POLL_INTERVAL_MAX_S) {
-                    poll_interval_s = MAP_POLL_INTERVAL_MAX_S;
-                }
-                TSNODE_LOGW(TAG, "map poll error, backoff to %us",
-                            poll_interval_s);
-
-                if (poll_consecutive_errors >= 3) {
-                    TSNODE_LOGE(TAG, "too many map poll errors — "
-                                "dropping connection for reconnect");
-                    break;  /* exit poll loop → outer loop reconnects */
-                }
-                continue;
-            }
-
-            /* Success: reset poll backoff */
-            poll_consecutive_errors = 0;
-            poll_interval_s = MAP_POLL_INTERVAL_BASE_S;
-
-            wg_log_counters();
-
-            tsnode_err_t wg_err = update_wg_peers(&netmap);
-            if (wg_err != TSNODE_OK) {
-                TSNODE_LOGW(TAG, "WG peer update failed: %d", wg_err);
-            }
-
-            if (s_disco_initialized) {
-                uint32_t stun_ip = netmap.stun.valid ? netmap.stun.ip : 0;
-                uint16_t stun_port = netmap.stun.valid ? netmap.stun.port : 0;
-                tsnode_disco_poll(&s_disco, stun_ip, stun_port, s_wg_sock,
-                                  tsnode_wg_crypto_mbedtls());
-            }
+        /* El stream de /machine/map es long-lived: h2_post_stream no
+         * retorna hasta que el server cierra el stream, la conexión muere,
+         * o el fail-closed de silencio (>100s sin frames) se dispara.
+         * ONLINE, netmap y data plane se aplican desde el callback del h2
+         * (map_stream_on_data). Cualquier retorno = motivo de reconexión. */
+        tsnode_err_t stream_err = do_map_stream();
+        if (stream_err != TSNODE_OK) {
+            TSNODE_LOGW(TAG, "map stream ended with error: %d", stream_err);
         }
 
-        /* Poll loop exited — reconnect unless stop was requested */
-        TSNODE_LOGI(TAG, "poll loop exited (state=%d)", (int)s_state);
+        /* Stream exited — reconnect unless stop was requested (stop() cierra
+         * la conexión ts2021: el read bloqueado falla y el loop externo ve
+         * s_state==IDLE → sale limpio). */
+        TSNODE_LOGI(TAG, "map stream exited (state=%d)", (int)s_state);
         reconnect_backoff_s = RECONNECT_BACKOFF_MIN_S;
     }
 
@@ -1830,7 +1780,12 @@ static void client_task(void *arg)
 
 tsnode_err_t tsnode_client_start(const tsnode_client_config_t *config)
 {
-    if (config == NULL || config->auth_key == NULL) {
+    /* auth_key es OPCIONAL (ADR-0021): con identidad registrada (regdone en
+     * NVS) el nodo se autentica con su node key y no precisa auth key. Sin
+     * auth key Y sin identidad registrada, do_connect() falla con
+     * TSNODE_ERR_PROVISIONING al llegar al paso de registro. control_host
+     * tiene default (controlplane.tailscale.com). */
+    if (config == NULL) {
         return TSNODE_ERR_INVALID_ARG;
     }
     if (s_state != TSNODE_CLIENT_IDLE && s_state != TSNODE_CLIENT_ERROR &&

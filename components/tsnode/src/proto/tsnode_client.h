@@ -43,7 +43,8 @@ typedef enum {
 typedef struct {
     const char *control_host;       /* "controlplane.tailscale.com" */
     uint16_t    control_port;       /* 80 for HTTP upgrade */
-    const char *auth_key;           /* tskey-auth-... */
+    const char *auth_key;           /* tskey-auth-...; NULL si la identidad ya
+                                       está registrada (regdone, ADR-0021) */
     const char *hostname;           /* node hostname */
     uint8_t     machine_key_priv[32]; /* our machine key (or zeroed to generate) */
     /* WireGuard UDP endpoint (IP:port) — sent in MapRequest for connectivity */
@@ -56,7 +57,9 @@ typedef struct {
 
 /*
  * Start the Tailscale client task.
- * Requires: WiFi connected, auth_key provisioned.
+ * Requires: WiFi connected. auth_key solo es obligatorio si la identidad
+ * NVS no completó aún el registro (ADR-0021): con regdone, el nodo se
+ * autentica con su node key persistida.
  * El cliente COPIA el struct Y los strings (control_host, auth_key,
  * hostname) a storage propio: los punteros del caller pueden ser stack.
  */

@@ -190,6 +190,34 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
     return TSNODE_OK;
 }
 
+/* Da de baja un peer por su WG key (ADR-0021: PeersRemoved del stream de
+ * map). Shift compacto + wipe del slot: se borran endpoints, la ruta
+ * directa confirmada (direct_ip/port) y el estado de retry — un peer que
+ * salió de la tailnet no debe poder "existir" en nuestra tabla disco. El
+ * índice del peer no es estable entre add/remove: el data plane busca
+ * siempre por clave (find_peer_by_wg_key), no por slot. */
+tsnode_err_t tsnode_disco_remove_peer(tsnode_disco_state_t *st,
+                                      const uint8_t wg_pubkey[32])
+{
+    if (st == NULL || wg_pubkey == NULL) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < st->n_peers; i++) {
+        if (memcmp(st->peers[i].wg_pubkey, wg_pubkey, 32) == 0) {
+            /* Shift compacto (mueve el último al hueco): elimina el slot. */
+            int last = st->n_peers - 1;
+            if (i != last) {
+                st->peers[i] = st->peers[last];
+            }
+            memset(&st->peers[last], 0, sizeof(st->peers[0]));
+            st->n_peers--;
+            TSNODE_LOGI(TAG, "disco peer removed (n_peers=%d)", st->n_peers);
+            return TSNODE_OK;
+        }
+    }
+    return TSNODE_OK; /* ya no estaba: idempotente */
+}
+
 /* ---- Packet detection ---- */
 
 bool tsnode_disco_is_disco_packet(const uint8_t *pkt, size_t len)

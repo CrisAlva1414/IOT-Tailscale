@@ -6,6 +6,7 @@ idf_component_register(
          "prov_store.c"
          "tsnode_simple.c"
          "display.c"
+         "autostart.c"
     INCLUDE_DIRS "."
     REQUIRES tsnode nvs_flash esp_wifi esp_event esp_netif driver
 )

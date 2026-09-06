@@ -373,6 +373,29 @@ int tsnode_wg_peer_add(tsnode_wg_device_t *dev,
     return slot;
 }
 
+/* Da de baja un peer por su clave pública (ADR-0021: PeersRemoved del
+ * stream de map). Hace wipe COMPLETO del slot — claves derivadas, estado
+ * de handshake y de sesión incluidos — para que el peer removido no deje
+ * rastro usable (sesiones, contadores de replay) en el device. Los índices
+ * de peers NO se reordenan: los arrays del caller (p.ej. s_wg_ep_ip en el
+ * cliente) quedan alineados con los slots. */
+tsnode_err_t tsnode_wg_peer_remove(tsnode_wg_device_t *dev,
+                                   const uint8_t pubkey[TSNODE_WG_KEY_LEN])
+{
+    if (dev == NULL || !dev->initialized || pubkey == NULL) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+    for (unsigned i = 0; i < TSNODE_WG_MAX_PEERS; i++) {
+        tsnode_wg_peer_t *p = &dev->peers[i];
+        if (!p->used) continue;
+        if (ct_equal(p->cfg.public_key, pubkey, TSNODE_WG_KEY_LEN)) {
+            memset(p, 0, sizeof(*p)); /* wipe secreto + sesión (used=false) */
+            return TSNODE_OK;
+        }
+    }
+    return TSNODE_OK; /* ya no estaba: idempotente */
+}
+
 /* ---- Outbound initiation (CreateMessageInitiation) ---- */
 
 tsnode_err_t tsnode_wg_create_initiation(

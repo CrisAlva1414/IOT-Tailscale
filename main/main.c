@@ -29,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "autostart.h"
 #include "console.h"
 #include "display.h"
 #include "prov_store.h"
@@ -71,9 +72,14 @@ void app_main(void)
     /* Start serial console for debugging/provisioning */
     console_start();
 
-    /*
-     * NOTE: The Tailscale client is NOT started automatically here.
-     * Use 'tsconnect' from the serial console, or for a production
-     * project use the simple API shown in the comment above.
-     */
+    /* Autostart del cliente tsnode (ADR-0021 2d): si hay credenciales en
+     * NVS, conecta por sí solo al boot; si no, espera provisioning y la
+     * consola ('tskey set') lo vuelve a disparar. */
+    terr = autostart_start();
+    ESP_LOGI(TAG, "autostart_start -> %s", tsnode_err_name(terr));
 }
+
+/*
+ * NOTE: el arranque manual sigue disponible con 'tsconnect' desde la
+ * consola (para el matchear contra el stub local: 'tsconnectlocal').
+ */

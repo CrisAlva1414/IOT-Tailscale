@@ -1236,6 +1236,371 @@ static void test_map_parse_peer_no_endpoints(void)
     CHECK(netmap.peers[0].online == false);
 }
 
+/* ---- Map stream splitter tests (ADR-0021) ---- */
+
+/* Claves de test (64 hex chars c/u, corresponden a los peers de los deltas) */
+#define KEY_A "1122334455667788112233445566778811223344556677881122334455667788"
+#define KEY_B "2233445566778899223344556677889922334455667788992233445566778899"
+#define KEY_C "3344556677881122334455667788112233445566778811223344556677881122"
+
+/* Arma un mensaje con framing [u32 LE length][payload] en dst. */
+static void frame_msg(uint8_t *dst, const char *json)
+{
+    size_t jlen = strlen(json);
+    dst[0] = (uint8_t)(jlen & 0xff);
+    dst[1] = (uint8_t)((jlen >> 8) & 0xff);
+    dst[2] = (uint8_t)((jlen >> 16) & 0xff);
+    dst[3] = (uint8_t)((jlen >> 24) & 0xff);
+    memcpy(dst + 4, json, jlen);
+}
+
+static void test_map_stream_single_message(void)
+{
+    const char *json = "{\"KeepAlive\":true}";
+    size_t jlen = strlen(json);
+    uint8_t framed[4 + 64];
+    frame_msg(framed, json);
+
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    CHECK(tsnode_map_stream_feed(&st, framed, 4 + jlen) == TSNODE_OK);
+
+    const uint8_t *msg = NULL;
+    size_t mlen = 0;
+    bool has = false;
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(has);
+    CHECK(mlen == jlen);
+    CHECK(memcmp(msg, json, jlen) == 0);
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(!has);
+}
+
+static void test_map_stream_byte_by_byte(void)
+{
+    const char *json = "{\"PeersRemoved\":[]}";
+    size_t jlen = strlen(json);
+    uint8_t framed[4 + 64];
+    frame_msg(framed, json);
+
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    const uint8_t *msg = NULL;
+    size_t mlen = 0;
+    bool has = false;
+    /* Alimentar byte a byte: el mensaje emerge recién con el último byte. */
+    bool got = false;
+    for (size_t i = 0; i < 4 + jlen; i++) {
+        CHECK(tsnode_map_stream_feed(&st, framed + i, 1) == TSNODE_OK);
+        CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+        if (i == 4 + jlen - 1) {
+            CHECK(has);
+            got = has;
+        } else {
+            CHECK(!has);
+        }
+    }
+    CHECK(got);
+    CHECK(mlen == jlen);
+    CHECK(memcmp(msg, json, jlen) == 0);
+    /* El mensaje entregado se consume en la próxima llamada. */
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(!has);
+}
+
+static void test_map_stream_two_messages_one_feed(void)
+{
+    const char *j1 = "{\"KeepAlive\":true}";
+    const char *j2 = "{\"PeersRemoved\":[]}";
+    uint8_t both[2 * (4 + 64)];
+    frame_msg(both, j1);
+    frame_msg(both + 4 + strlen(j1), j2);
+    size_t both_len = 4 + strlen(j1) + 4 + strlen(j2);
+
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    CHECK(tsnode_map_stream_feed(&st, both, both_len) == TSNODE_OK);
+
+    const uint8_t *msg = NULL;
+    size_t mlen = 0;
+    bool has = false;
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(has);
+    CHECK(mlen == strlen(j1));
+    CHECK(memcmp(msg, j1, strlen(j1)) == 0);
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(has);
+    CHECK(mlen == strlen(j2));
+    CHECK(memcmp(msg, j2, strlen(j2)) == 0);
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) == TSNODE_OK);
+    CHECK(!has);
+}
+
+static void test_map_stream_declared_overflow_fails(void)
+{
+    /* Length declarado de 0xFFFFFFFF: input hostil (AGENTS.md §4), se
+     * valida contra el techo fijo antes de acumular nada. */
+    uint8_t evil[4] = {0xff, 0xff, 0xff, 0xff};
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    const uint8_t *msg = NULL;
+    size_t mlen = 0;
+    bool has = false;
+    CHECK(tsnode_map_stream_feed(&st, evil, 4) == TSNODE_OK);
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) ==
+          TSNODE_ERR_NETWORK);
+}
+
+static void test_map_stream_accumulator_overflow_fails(void)
+{
+    /* Más bytes que el cap del acumulador: jamás se indexa con eso, se
+     * rechaza closed. */
+    uint8_t big[TSNODE_MAP_STREAM_BUF + 1] = {0};
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    CHECK(tsnode_map_stream_feed(&st, big, sizeof(big)) ==
+          TSNODE_ERR_NO_MEMORY);
+    /* Ningún byte tocó el estado. */
+    CHECK(st.len == 0);
+    CHECK(!st.have_len);
+}
+
+static void test_map_stream_zstd_detected(void)
+{
+    /* Declarado 8, payload arranca con magia zstd (28 B5 2F FD): fail-closed,
+     * nunca pedimos compresión (ADR-0009 D2). */
+    uint8_t wire[12] = {0x08, 0x00, 0x00, 0x00, 0x28, 0xB5, 0x2F,
+                        0xFD, 0x00, 0x00, 0x00, 0x00};
+    tsnode_map_stream_t st;
+    tsnode_map_stream_init(&st);
+    const uint8_t *msg = NULL;
+    size_t mlen = 0;
+    bool has = false;
+    CHECK(tsnode_map_stream_feed(&st, wire, sizeof(wire)) == TSNODE_OK);
+    CHECK(tsnode_map_stream_next(&st, &msg, &mlen, &has) ==
+          TSNODE_ERR_NOT_IMPLEMENTED);
+}
+
+/* ---- MapResponse delta application tests (ADR-0021) ---- */
+
+/* Netmap completo con los peers A y B. */
+static const char *NETMAP_AB =
+    "{\"Self\":{\"PublicKey\":\"nodekey:" KEY_A "\","
+    "\"Addrs\":[\"100.64.0.10/32\"]},"
+    "\"Peers\":["
+    "{\"Key\":\"nodekey:" KEY_A
+    "\",\"AllowedIPs\":[\"100.64.0.20/32\"],"
+    "\"Endpoints\":[\"192.0.2.100:51820\"]},"
+    "{\"Key\":\"nodekey:" KEY_B
+    "\",\"AllowedIPs\":[\"100.64.0.21/32\"],"
+    "\"Endpoints\":[\"192.0.2.101:51820\"]}"
+    "]}";
+
+static void test_map_apply_full_replaces(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(is_full);
+    CHECK(updated);
+    CHECK(netmap.peer_count == 2);
+    CHECK(strcmp(netmap.self_ip, "100.64.0.10") == 0);
+    CHECK(n_removed == 0);
+
+    /* Segundo full con UN solo peer: reemplazo total, no suma. */
+    const char *netmap_c =
+        "{\"Self\":{\"PublicKey\":\"nodekey:" KEY_A "\","
+        "\"Addrs\":[\"100.64.0.10/32\"]},"
+        "\"Peers\":[{\"Key\":\"nodekey:" KEY_C
+        "\",\"AllowedIPs\":[\"100.64.0.33/32\"]}]}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, netmap_c, strlen(netmap_c),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(is_full);
+    CHECK(netmap.peer_count == 1);
+    uint8_t expect_c[32];
+    CHECK(unhex(KEY_C, expect_c, sizeof(expect_c)) == 32);
+    CHECK(memcmp(netmap.peers[0].key, expect_c, 32) == 0);
+}
+
+static void test_map_apply_peers_changed_upsert(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+
+    /* Delta: se agrega el peer C vía PeersChanged. */
+    const char *delta =
+        "{\"PeersChanged\":[{\"Key\":\"nodekey:" KEY_C
+        "\",\"AllowedIPs\":[\"100.64.0.33/32\"],"
+        "\"Endpoints\":[\"203.0.113.9:51820\"]}]}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, delta, strlen(delta),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(updated);
+    CHECK(netmap.peer_count == 3);
+    CHECK(strcmp(netmap.peers[2].tailscale_ip, "100.64.0.33") == 0);
+    CHECK(netmap.peers[2].n_endpoints == 1);
+    CHECK(strcmp(netmap.peers[2].endpoints[0].ip, "203.0.113.9") == 0);
+}
+
+static void test_map_apply_peers_changed_update(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+
+    /* Delta: el peer A cambia de endpoint (misma key → update, no dup). */
+    const char *delta =
+        "{\"PeersChanged\":[{\"Key\":\"nodekey:" KEY_A
+        "\",\"AllowedIPs\":[\"100.64.0.20/32\"],"
+        "\"Endpoints\":[\"198.51.100.7:51820\"]}]}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, delta, strlen(delta),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(updated);
+    CHECK(netmap.peer_count == 2);  /* sin duplicados */
+    CHECK(strcmp(netmap.peers[0].endpoints[0].ip, "198.51.100.7") == 0);
+}
+
+static void test_map_apply_peers_removed(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+
+    /* Delta: el peer A se va de la tailnet. */
+    const char *delta = "{\"PeersRemoved\":[\"nodekey:" KEY_A "\"]}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, delta, strlen(delta),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(updated);
+    CHECK(n_removed == 1);
+    uint8_t expect_a[32];
+    CHECK(unhex(KEY_A, expect_a, sizeof(expect_a)) == 32);
+    CHECK(memcmp(removed[0], expect_a, 32) == 0);
+    CHECK(netmap.peer_count == 1);
+    /* El sobreviviente es B. */
+    uint8_t expect_b[32];
+    CHECK(unhex(KEY_B, expect_b, sizeof(expect_b)) == 32);
+    CHECK(memcmp(netmap.peers[0].key, expect_b, 32) == 0);
+}
+
+static void test_map_apply_online_change(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+
+    const char *on = "{\"OnlineChange\":{\"nodekey:" KEY_B "\":true}}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, on, strlen(on),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(updated == false);
+    CHECK(netmap.peers[1].online == true);
+
+    const char *off = "{\"OnlineChange\":{\"nodekey:" KEY_B "\":false}}";
+    CHECK(tsnode_map_apply_response(&netmap, off, strlen(off),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(netmap.peers[1].online == false);
+}
+
+static void test_map_apply_keepalive_noop(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+
+    const char *ka = "{\"KeepAlive\":true}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, ka, strlen(ka),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(!updated);
+    CHECK(netmap.peer_count == 2);  /* nada tocado */
+}
+
+static void test_map_apply_invalid_args(void)
+{
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+    CHECK(tsnode_map_apply_response(NULL, NETMAP_AB, strlen(NETMAP_AB),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_ERR_INVALID_ARG);
+    CHECK(tsnode_map_apply_response(&netmap, NULL, 10,
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_ERR_INVALID_ARG);
+    CHECK(tsnode_map_apply_response(&netmap, NETMAP_AB, 0,
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_ERR_INVALID_ARG);
+}
+
+/* KeepAlive solo viaja en modo stream (ADR-0021 2a): el request de poll
+ * histórico no debe cambiarlo. */
+static void test_map_build_request_keepalive_only_stream(void)
+{
+    uint8_t nk[32] = {0};
+    uint8_t dk[32] = {0};
+    char req[512];
+    size_t len = 0;
+
+    CHECK(tsnode_map_build_request(req, sizeof(req), &len,
+                                   nk, dk, "esp32", 145, true, 0, 0) ==
+          TSNODE_OK);
+    CHECK(strstr(req, "\"Stream\":true") != NULL);
+    CHECK(strstr(req, "\"KeepAlive\":true") != NULL);
+
+    CHECK(tsnode_map_build_request(req, sizeof(req), &len,
+                                   nk, dk, "esp32", 145, false, 0, 0) ==
+          TSNODE_OK);
+    CHECK(strstr(req, "\"Stream\":false") != NULL);
+    CHECK(strstr(req, "\"KeepAlive\":true") == NULL);
+}
+
 int main(void)
 {
     RUN(test_hpack_register_vector);
@@ -1269,6 +1634,20 @@ int main(void)
     RUN(test_map_parse_peer_no_endpoints);
     RUN(test_map_parse_multi_peer_no_desync);
     RUN(test_map_parse_peer_endpoint_lan_late);
+    RUN(test_map_stream_single_message);
+    RUN(test_map_stream_byte_by_byte);
+    RUN(test_map_stream_two_messages_one_feed);
+    RUN(test_map_stream_declared_overflow_fails);
+    RUN(test_map_stream_accumulator_overflow_fails);
+    RUN(test_map_stream_zstd_detected);
+    RUN(test_map_apply_full_replaces);
+    RUN(test_map_apply_peers_changed_upsert);
+    RUN(test_map_apply_peers_changed_update);
+    RUN(test_map_apply_peers_removed);
+    RUN(test_map_apply_online_change);
+    RUN(test_map_apply_keepalive_noop);
+    RUN(test_map_apply_invalid_args);
+    RUN(test_map_build_request_keepalive_only_stream);
 
     printf("%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed == 0 ? 0 : 1;

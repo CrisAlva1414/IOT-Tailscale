@@ -207,6 +207,13 @@ tsnode_err_t tsnode_wg_device_init(tsnode_wg_device_t *dev,
 int tsnode_wg_peer_add(tsnode_wg_device_t *dev,
                        const tsnode_wg_peer_cfg_t *cfg);
 
+/* Remove a peer by public key (ADR-0021, PeersRemoved del stream de map).
+ * Wipes the whole slot (derived keys, handshake and session state). Peer
+ * slots are never reordered: client-side arrays indexed by peer index stay
+ * aligned. Idempotent: removing a peer that is not present returns OK. */
+tsnode_err_t tsnode_wg_peer_remove(tsnode_wg_device_t *dev,
+                                   const uint8_t pubkey[TSNODE_WG_KEY_LEN]);
+
 /* ---- Outbound handshake ---- */
 
 /*

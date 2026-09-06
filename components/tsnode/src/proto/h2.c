@@ -74,6 +74,10 @@ typedef struct {
     uint32_t req_stream;
     bool seen_headers;
     bool done;
+    /* Modo streaming (ADR-0021): si on_data != NULL, los payloads de DATA
+     * se entregan al callback en lugar de acumularse en resp. */
+    tsnode_err_t (*on_data)(const uint8_t *data, size_t len, void *ctx);
+    void *on_data_ctx;
 } h2_resp_ctx_t;
 
 /* ---- Helpers de envío ---- */
@@ -334,13 +338,21 @@ static tsnode_err_t handle_frame(h2_conn_t *h, const h2_frame_view_t *f,
         if (rc == NULL || !rc->seen_headers) return TSNODE_ERR_NETWORK;
         if (f->stream_id != rc->req_stream) return TSNODE_ERR_NETWORK;
         if (f->flags & H2_FLAG_PADDED) return TSNODE_ERR_NETWORK;
-        if ((size_t)f->length > rc->resp_cap - rc->resp_len) {
-            /* Overflow de respuesta → error explícito, nunca truncado
-             * silencioso (AGENTS.md §4). Caller dimensiona según ADR-0009 D3. */
-            return TSNODE_ERR_NO_MEMORY;
+        if (rc->on_data != NULL) {
+            /* Modo streaming: el callback consume el payload (que puede ser
+             * un fragmento de mensaje). El callback es el dueño del framing. */
+            tsnode_err_t derr = rc->on_data(f->payload, f->length,
+                                            rc->on_data_ctx);
+            if (derr != TSNODE_OK) return derr;
+        } else {
+            if ((size_t)f->length > rc->resp_cap - rc->resp_len) {
+                /* Overflow de respuesta → error explícito, nunca truncado
+                 * silencioso (AGENTS.md §4). Caller dimensiona según ADR-0009 D3. */
+                return TSNODE_ERR_NO_MEMORY;
+            }
+            memcpy(rc->resp + rc->resp_len, f->payload, f->length);
+            rc->resp_len += f->length;
         }
-        memcpy(rc->resp + rc->resp_len, f->payload, f->length);
-        rc->resp_len += f->length;
         if (f->flags & H2_FLAG_END_STREAM) rc->done = true;
         return TSNODE_OK;
 
@@ -537,6 +549,88 @@ tsnode_err_t h2_post_keepalive(h2_conn_t *h, const char *authority,
     }
 
     *resp_len = rc.resp_len;
+    return TSNODE_OK;
+}
+
+tsnode_err_t h2_post_stream(h2_conn_t *h, const char *authority,
+                            const char *path, const char *lb_value,
+                            const uint8_t *body, size_t body_len,
+                            tsnode_err_t (*on_data)(const uint8_t *data,
+                                                    size_t len, void *ctx),
+                            void *on_data_ctx, uint32_t max_silent_pings)
+{
+    if (h == NULL || !h->started || authority == NULL || path == NULL ||
+        body == NULL || on_data == NULL) {
+        return TSNODE_ERR_INVALID_ARG;
+    }
+    if (body_len > H2_MAX_FRAME_PAYLOAD) return TSNODE_ERR_INVALID_ARG;
+
+    uint32_t stream_id = h->next_stream_id;
+    h->next_stream_id += 2;
+
+    /* HEADERS + bloque HPACK (calza holgado en ~350 bytes reales). */
+    uint8_t hdr_block[512];
+    size_t hdr_block_len;
+    tsnode_err_t err = h2_build_request_headers(hdr_block, sizeof(hdr_block),
+                                                 authority, path, lb_value,
+                                                 &hdr_block_len);
+    if (err != TSNODE_OK) return err;
+
+    uint8_t head_frame[H2_HEADER_LEN + sizeof(hdr_block)];
+    put_frame_header(head_frame, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS,
+                     stream_id, (uint32_t)hdr_block_len);
+    memcpy(head_frame + H2_HEADER_LEN, hdr_block, hdr_block_len);
+    err = send_all(&h->io, head_frame, H2_HEADER_LEN + hdr_block_len);
+    if (err != TSNODE_OK) return err;
+
+    /* DATA con END_STREAM: el stream queda abierto del lado del server
+     * (envía DATA continuos hasta que cierra él con RST/GOAWAY). */
+    uint8_t data_hdr[H2_HEADER_LEN];
+    put_frame_header(data_hdr, H2_FRAME_DATA, H2_FLAG_END_STREAM, stream_id,
+                     (uint32_t)body_len);
+    err = send_all(&h->io, data_hdr, sizeof(data_hdr));
+    if (err != TSNODE_OK) return err;
+    err = send_all(&h->io, body, body_len);
+    if (err != TSNODE_OK) return err;
+
+    h2_resp_ctx_t rc = {
+        .resp = NULL,
+        .resp_cap = 0,
+        .resp_len = 0,
+        .req_stream = stream_id,
+        .seen_headers = false,
+        .done = false,
+        .on_data = on_data,
+        .on_data_ctx = on_data_ctx,
+    };
+
+    /* Mismo loop de keepalive inline que h2_post_keepalive (ADR-0020): un
+     * timeout de la capa de registros dispara un PING fire-and-forget; si
+     * tras max_silent_pings timeouts consecutivos no llegó NINGÚN frame el
+     * stream está muerto en half-open → NETWORK (fail-closed ≤100s). El
+     * server sano manda keepalives ~1/min y ACKea cada PING. */
+    uint32_t silent_pings = 0;
+    while (!rc.done) {
+        h2_frame_view_t f;
+        err = peek_frame(h, &f);
+        if (err == TSNODE_ERR_TIMEOUT) {
+            if (silent_pings >= max_silent_pings) {
+                return TSNODE_ERR_NETWORK;
+            }
+            err = h2_ping_send(h);
+            if (err != TSNODE_OK) return err;
+            silent_pings++;
+            continue;
+        }
+        if (err != TSNODE_OK) return err;
+        err = handle_frame(h, &f, &rc);
+        if (err != TSNODE_OK) return err;
+        consume_frame(h, &f);
+        /* Cualquier frame recibido (= algo llegó del par) despeja el
+         * contador de silencio. */
+        silent_pings = 0;
+    }
+
     return TSNODE_OK;
 }
 

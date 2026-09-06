@@ -143,6 +143,15 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
 int tsnode_disco_find_peer_by_wg_key(const tsnode_disco_state_t *st,
                                      const uint8_t wg_pubkey[32]);
 
+/*
+ * Remove a peer by its WireGuard public key (ADR-0021, PeersRemoved of the
+ * map stream). Compact shift + full wipe of the slot (endpoints, confirmed
+ * direct path, retry state). Idempotent: removing a peer that is not
+ * present returns OK.
+ */
+tsnode_err_t tsnode_disco_remove_peer(tsnode_disco_state_t *st,
+                                      const uint8_t wg_pubkey[32]);
+
 /* ---- Packet handling ---- */
 
 /*

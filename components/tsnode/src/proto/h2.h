@@ -130,6 +130,27 @@ tsnode_err_t h2_post_keepalive(h2_conn_t *h, const char *authority,
                                uint8_t *resp, size_t resp_cap,
                                size_t *resp_len, uint32_t max_silent_pings);
 
+/*
+ * POST en modo streaming (ADR-0021): igual que h2_post_keepalive() en el
+ * manejo de timeout (PING inline + fail-closed tras max_silent_pings) pero
+ * cada payload de frame DATA del stream se entrega al callback on_data tal
+ * cual llega (un frame puede ser parte de un mensaje, un mensaje completo o
+ * contener varios) — el CALLER arma el framing de mensajes. No hay buffer de
+ * respuesta única: el callback es el consumidor.
+ *
+ * Retorna TSNODE_OK cuando el server cierra el stream con END_STREAM
+ * (el stream de map termina así en re-sync; el caller re-establece el
+ * stream). Cualquier fallo de protocolo/transporte (GOAWAY, RST, EOF sin
+ * END_STREAM, overflow) propaga el error fail-closed. Si el callback
+ * devuelve un error, se corta y se retorna ese error.
+ */
+tsnode_err_t h2_post_stream(h2_conn_t *h, const char *authority,
+                            const char *path, const char *lb_value,
+                            const uint8_t *body, size_t body_len,
+                            tsnode_err_t (*on_data)(const uint8_t *data,
+                                                    size_t len, void *ctx),
+                            void *on_data_ctx, uint32_t max_silent_pings);
+
 /* Solo para tests: codifica el bloque HPACK del request. Orden fijo:
  * :method POST, :scheme https, :authority, :path, [ts-lb], content-type.
  * Vector de referencia generado contra producción (sesión 2026-08-23). */

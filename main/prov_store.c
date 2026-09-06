@@ -173,3 +173,21 @@ tsnode_err_t prov_store_wipe(void)
     nvs_close(h);
     return nvs_to_tsnode(err);
 }
+
+tsnode_err_t prov_store_wipe_tskey(void)
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(PROV_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return nvs_to_tsnode(err);
+    }
+    err = nvs_erase_key(h, "ts_auth_key");
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Idempotente: no había key que borrar. */
+        err = ESP_OK;
+    }
+    nvs_close(h);
+    return nvs_to_tsnode(err);
+}

@@ -47,6 +47,15 @@ tsnode_err_t prov_store_has_tskey(bool *out_key);
 /* Borra todas las credenciales provisionadas. Idempotente. */
 tsnode_err_t prov_store_wipe(void);
 
+/*
+ * Borra SOLO la auth key de un solo uso (ADR-0021 2c). Una vez que el nodo
+ * alcanza ONLINE, esa key ya cumplió su función (y es de un solo uso): si
+ * quedara en NVS, un reset posterior con identidad sin registrar (caso
+ * límite) la reutilizaría sin necesidad. Las credenciales wifi y la
+ * identidad registrada NO se tocan. Idempotente.
+ */
+tsnode_err_t prov_store_wipe_tskey(void);
+
 #ifdef __cplusplus
 }
 #endif

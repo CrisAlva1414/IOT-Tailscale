@@ -19,6 +19,7 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 
+#include "autostart.h"
 #include "prov_store.h"
 #include "tsnode.h"
 #include "tsnode_client.h"
@@ -137,6 +138,11 @@ static void cmd_tskey_set(void)
         return;
     }
     console_write("guardada. se consumira al registrar contra el control plane\r\n");
+
+    /* Provisioning tardío: si el boot ocurrió sin credenciales, autostart
+     * ya salió sin hacer nada. Con la key recién guardada se re-dispara
+     * (ADR-0021 2d). Si el cliente ya corre, es no-op. */
+    (void)autostart_start();
 }
 
 static void cmd_status(void)
@@ -197,10 +203,17 @@ static void tsconnect_common(const char *host, uint16_t port,
         return;
     }
 
+    /* auth key OPCIONAL (ADR-0021): tras el primer registro exitoso se borra
+     * de NVS (2c) y el nodo se autentica con su node key persistida. Si no
+     * hay key Y la identidad no está registrada, el cliente responde con
+     * TSNODE_ERR_PROVISIONING y log claro. */
     char auth_key[PROV_TSKEY_MAX_LEN];
+    const char *auth_key_used = NULL;
     tsnode_err_t terr = prov_store_get_tskey(auth_key, sizeof(auth_key));
-    if (terr != TSNODE_OK) {
-        console_write("error: no hay auth key cargada (usar 'tskey set')\r\n");
+    if (terr == TSNODE_OK) {
+        auth_key_used = auth_key;
+    } else if (terr != TSNODE_ERR_NOT_INITIALIZED) {
+        console_write("error leyendo auth key de NVS\r\n");
         return;
     }
 
@@ -228,7 +241,7 @@ static void tsconnect_common(const char *host, uint16_t port,
     tsnode_client_config_t cfg = {
         .control_host = host,
         .control_port = port,
-        .auth_key = auth_key,
+        .auth_key = auth_key_used,
         .hostname = hostname,
         .endpoint_ip = endpoint_ip,
         .endpoint_port = endpoint_port,
