@@ -1,4 +1,4 @@
-# Project Goals — tailnet-esp32-node
+# Project Goals — IOT-Tailscale
 
 Este archivo define los objetivos medibles del proyecto. El loop agent itera hasta que TODOS los goals estén completos.
 
@@ -112,7 +112,11 @@ tailnet ni el autostart.
 **Archivos clave**: `components/tsnode/src/proto/h2.{c,h}`, `components/tsnode/src/proto/tsnode_map.{c,h}`, `components/tsnode/src/proto/tsnode_client.{c,h}`, `components/tsnode/src/wg/wg.{c,h}`, `components/tsnode/src/disco/disco.{c,h}`, `main/autostart.{c,h}`, `main/prov_store.{c,h}`, `main/main.c`, `main/console.c`, `tests/unit/test_h2.c`, `docs/adr/0021-map-streaming-and-autostart.md`, `docs/sessions/2026-09-06-map-streaming-autostart.md`, `docs/sessions/2026-09-06-goal8-hardware-chunked-netmap-online-fix.md`
 
 ### GOAL-7: Flash encryption en Release mode
-**Estado**: BUILD READY (config completa, build Release exitoso, pendiente flasheo en hardware)
+**Estado**: DIFERIDO (decisión del operador: el dispositivo puede no salir del
+entorno controlado del banco; no bloquea compartir/publicar el repo). Build
+firmware listo (`BUILD READY`), config completa, build Release exitoso; el
+flasheo en hardware queda a decisión explícita del usuario porque quema el
+eFuse FLASH_CRYPT_CNT de forma irreversible.
 **Criterio de éxito**: Build Release con flash encryption activa, probado en hardware.
 **Estado técnico**: Particion table custom `partitions.csv` creada con `nvs_keys` (8K, encrypted flag).
 Offset de partition table subido a 0xB000 (bootloader con flash encryption ocupa 0x90b0, excede el default 0x8000).

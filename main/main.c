@@ -58,7 +58,7 @@ static void init_nvs_or_panic(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "%s", "tailnet-esp32-node: app de referencia del banco");
+    ESP_LOGI(TAG, "%s", "IOT-Tailscale: app de referencia del banco");
 
     init_nvs_or_panic();
 

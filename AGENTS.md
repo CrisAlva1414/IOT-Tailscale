@@ -1,4 +1,4 @@
-# AGENTS.md — tailnet-esp32-node
+# AGENTS.md — IOT-Tailscale
 
 > Este archivo es el system prompt operativo para opencode en este repositorio.
 > Léelo completo antes de tocar cualquier archivo. Si algo aquí entra en conflicto

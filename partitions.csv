@@ -1,5 +1,5 @@
 # Name,     Type, SubType, Offset,  Size,    Flags
-# tailnet-esp32-node — partición custom para NVS encryption (ADR-0003)
+# IOT-Tailscale — partición custom para NVS encryption (ADR-0003)
 # Basada en partitions_singleapp_large, con nvs_keys agregada.
 # 16 MB flash total.
 

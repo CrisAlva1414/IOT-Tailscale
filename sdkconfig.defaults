@@ -1,4 +1,4 @@
-# sdkconfig.defaults — tailnet-esp32-node
+# sdkconfig.defaults — IOT-Tailscale
 #
 # Base común para todos los builds. Seleccionar perfil específico:
 #   Desarrollo: SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dev"
