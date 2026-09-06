@@ -16,6 +16,7 @@ secrets.*.yaml
 !secrets.yaml.template
 .env
 .env.*
+!.env.example
 
 # Documentación operativa personal (ADR-0010) — NUNCA se commitea
 docs/private/

@@ -56,6 +56,12 @@ void app_main(void)
    - **Tags**: `tag:esp32-iot`
 3. Copiá la key (empieza con `tskey-auth-`)
 
+> **Seguridad de la key (ADR-0002/0003)**: la key es **de un solo uso**. Tras
+> el primer registro el firmware la purga de NVS y pasa a autenticarse con la
+> node key generada localmente. Si tu app hardcodea la key, que sea SOLO para
+> el banco de pruebas; para despliegues reales usá el serial console de
+> provisioning del app de referencia (`docs/adr/0007`).
+
 ## Paso 5: Compilar y flashear
 
 ```bash
@@ -86,6 +92,8 @@ tsnode_start(&(tsnode_app_config_t){
     .hostname      = "sensor-garaje",     /* NULL = auto de MAC */
     .control_host  = "controlplane.tailscale.com",  /* default */
     .control_port  = 80,                              /* default */
+    /* Para nodos ya registrados, .ts_auth_key = NULL: la identidad
+       persiste en NVS (node key) y no se re-registra (ADR-0021). */
 });
 ```
 

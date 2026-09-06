@@ -1,14 +1,36 @@
-# tailnet-esp32-node
+# IOT-Tailscale
 
-Cliente Tailscale mínimo en C puro para ESP32 (ESP-IDF, sin ESPHome), construido
-como reimplementación selectiva — no fork, no submódulo — del enfoque de
+[![CI](https://github.com/CrisAlva1414/IOT-Tailscale/actions/workflows/ci.yml/badge.svg)](https://github.com/CrisAlva1414/IOT-Tailscale/actions/workflows/ci.yml)
+
+Cliente Tailscale mínimo en **C puro** para ESP32 (ESP-IDF, sin ESPHome), como
+reimplementación selectiva — no fork, no submódulo — del enfoque de
 [`alfs/tailscale-iot`](https://github.com/alfs/tailscale-iot).
 
-**Estado:** plano de control completo + WireGuard data plane implementado y
-testeado. API simple: importar, definir 3 variables, y el device se conecta
-a la tailnet automáticamente. Ver Quick Start más abajo.
+Tu ESP32 se une a una tailnet de Tailscale, obtiene una IP `100.x.x.x` y se
+comunica con el resto de los nodos vía WireGuard con NAT traversal directo.
+Plano de control (ts2021 sobre Noise, registro, `/machine/map` streaming) y
+plano de datos (WireGuard + disco) implementados y validados en hardware.
 
-## Quick Start
+**Estado**: validado en hardware real (M5Stack Core 2): nodo online con
+uptime sostenido, `active/direct` en `tailscale status`, ping 0% pérdida,
+auth key purgada tras el registro. CI en verde para `esp32`, `esp32c3`,
+`esp32s3`, `esp32c6`.
+
+## Quick Start (2 caminos)
+
+**A — Usar el app de referencia (lo más simple):** clonar, definir credenciales,
+build, flash.
+
+```bash
+idf.py set-target esp32
+idf.py build
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+Las credenciales se ingresan por el **serial console de provisioning**
+(`docs/adr/0007`): WiFi SSID/PSK y auth key de Tailscale, sin hardcodear.
+
+**B — Usar `tsnode` como librería en tu propio proyecto:**
 
 ```c
 #include <nvs_flash.h>
@@ -19,91 +41,84 @@ void app_main(void)
     nvs_flash_init();
     tsnode_init();
     tsnode_start(&(tsnode_app_config_t){
-        .wifi_ssid   = "MiSSID",
-        .wifi_psk    = "MiPSK",
-        .ts_auth_key = "tskey-auth-...",
+        .wifi_ssid   = "<ssid>",
+        .wifi_psk    = "<wifi-psk>",
+        .ts_auth_key = "tskey-auth-...",   /* one-time; tras registrar se borra */
     });
-    /* listo, el device se conecta solo */
+    /* el device se conecta solo; el cliente corre en background */
 }
 ```
 
-Generá la auth key en https://login.tailscale.com/admin/settings/keys
-(recomendado: one-time, expiry 7 días, tag `tag:esp32-iot`).
+Pasos completos (copiar `components/tsnode`, flags de `sdkconfig`, auth key
+recomendada, troubleshooting): **`docs/QUICKSTART.md`**.
 
-Ver `docs/QUICKSTART.md` para la guía completa.
+### Generar la auth key
+
+1. https://login.tailscale.com/admin/settings/keys
+2. **Reusable**: OFF (one-time) · **Expiry**: 7 días · **Tags**: `tag:esp32-iot`
+3. Copiá la key (empieza con `tskey-auth-`)
+
+> Es mejor dejar la key fija al banco de pruebas: tras el primer registro el
+> firmware la purga de NVS y pasa a autenticarse con su node key (ADR-0021).
 
 ## Qué es esto
 
-Llevar dispositivos ESP32 a una tailnet personal de Tailscale (SaaS, no
-Headscale), con IP 100.x.x.x y conectividad directa vía WireGuard sobre NAT
-traversal, priorizando por sobre todo: **seguridad y estabilidad**.
+Llevar dispositivos ESP32 a una tailnet personal (Tailscale SaaS, no
+Headscale), con conectividad directa vía WireGuard sobre NAT traversal,
+priorizando por sobre todo: **seguridad y estabilidad** (en ese orden).
 
-Targets (ver `docs/adr/0004` y `docs/adr/0006`): validación primaria v1 sobre
-**M5Stack Core 2** (ESP32 clásico, primer despliegue real: intercomunicador).
-La librería apunta a toda la familia ESP32 con Wi-Fi para domótica y
-automatización — **Tier 1** con CI obligatorio: `esp32`, `esp32c3`,
-`esp32s3`, `esp32c6`; Tier 2 (sin hardware aún): `s2`, `c2`; excluido `h2`
-(sin Wi-Fi).
+- Target v1: **M5Stack Core 2** (ESP32 clásico); la librería apunta a toda la
+  familia ESP32 con Wi-Fi para domótica y automatización.
+- **Tier 1** (CI obligatorio en GitHub Actions): `esp32`, `esp32c3`, `esp32s3`,
+  `esp32c6`. Tier 2 (sin hardware aún): `s2`, `c2`. Excluido: `h2` (sin Wi-Fi).
+- Detalles de hardware y targets: `docs/adr/0004`, `docs/adr/0006`.
 
 ## Librería reutilizable
 
-`components/tsnode/` es un componente ESP-IDF autocontenido y reutilizable
+`components/tsnode/` es un componente ESP-IDF autocontenido
 (`docs/adr/0005-packaging-and-reuse.md`): API pública solo en su `include/`,
-sin lógica de aplicación adentro, compilación standalone verificada en CI.
-La arquitectura interna en capas (`docs/adr/0006`) mantiene el core en C puro
-— testeable en host, portable a toda la familia — con el acceso a plataforma
-confinado a una capa port. Cada proyecto de dispositivo consume el componente
-y agrega su capa de aplicación encima.
+sin lógica de aplicación adentro, con el core en **C puro** — sin headers de
+plataforma (verificado por un guard en CI) — y el acceso al sistema confinado
+a una capa de port de 16 funciones (`docs/INTEGRATION.md`).
 
-Para integrar en otro proyecto o portar a otra plataforma, ver
-`docs/INTEGRATION.md`.
+Cada proyecto consume el componente y agrega su capa de aplicación encima.
+La app de `main/` es un ejemplo completo de referencia (WiFi, provisioning por
+serial, autostart, display del banco).
+
+## Testing
+
+- Tests unitarios en host (sin ESP-IDF): `make -C tests/unit test` — 7 bins,
+  incl. vectors de protocolo de Noise/WireGuard/disco, ventana anti-replay,
+  parsers fuzz-oriented.
+- Análisis estático: `cppcheck` con flags en `docs/format/static-analysis.md`.
+- CI (GitHub Actions): build `-Werror` de 4 targets + cppcheck + arch-guard.
 
 ## Qué NO es esto (v1)
 
-- No soporta DERP (relay): si no hay ruta UDP directa, el nodo no conecta.
+- No soporta **DERP** (relay): si no hay ruta UDP directa, el nodo no conecta.
 - No soporta IPv6, subnet routing, exit node, ni MagicDNS local.
-- No es un fork de `alfs/tailscale-iot` ni depende de su código; es una
-  reimplementación propia inspirada en su enfoque general y en las
-  limitaciones que ese proyecto ya documentó (ver AGENTS.md para el detalle).
+- No es un fork de `alfs/tailscale-iot` ni depende de su código: es una
+  reimplementación propia, inspirada en su enfoque y en las limitaciones que
+  ese proyecto documentó.
 
-## Por qué existe, dado que ya existe `alfs/tailscale-iot`
+## Seguridad (léelo antes de desplegar fuera de un banco)
 
-Ese proyecto es un proof-of-concept honesto sobre sus propios límites: su
-autor lo describe como "Frankenstein PoC", código que funciona pero que
-desaconseja tocar a mano o usar como base de producción. Este repo parte de
-ahí pero con el objetivo inverso: cada decisión de protocolo, memoria y
-manejo de claves queda respaldada por un ADR (`docs/adr/`), con modelo de
-amenaza explícito y con seguridad física y remota tratadas con igual peso.
+- **Amenaza física y remota con igual prioridad.** Claves en flash extraíbles
+  por atacante con acceso físico; mitigación en `docs/adr/0003`.
+- En desarrollo se flashea en claro por defecto. Para desplegar en un entorno
+  no controlado seguí obligatoriamente `docs/adr/0002-threat-model.md` y el
+  checklist de `docs/INTEGRATION.md` (flash encryption Release, eFuses, ACLs).
+- Todo lo versionado es público (ADR-0010): sin credenciales, IPs reales ni
+  detalles del despliegue del operador en el repo.
 
-## Leer antes de contribuir o generar código aquí
+## Leer antes de generar código o contribuir
 
-`AGENTS.md` es el documento operativo completo (alcance, modelo de amenaza,
-reglas de C, estructura, proceso). Cualquier agente (humano o LLM) que trabaje
-en este repo debe leerlo primero.
-
-## Política de privacidad documental
-
-Todo lo versionado es público (ADR-0010): ningún `.md`, comentario de código ni
-test contiene credenciales, IPs reales ni detalles del despliegue personal de
-quien desarrolla — esos datos viven en `docs/private/`, que está gitignoreado.
-La convención completa (placeholders y checklist) está en
-`docs/format/documentation-privacy.md`.
-
-## Build
-
-Requiere ESP-IDF v5.5+ instalado.
-
-```
-idf.py set-target esp32     # primario v1 (M5Stack Core 2)
-idf.py set-target esp32c3   # Tier 1
-idf.py set-target esp32s3   # Tier 1
-idf.py set-target esp32c6   # Tier 1
-idf.py build
-```
-
-Sin flash encryption activa, esto es solo para desarrollo local en el banco de
-pruebas del usuario. Ver `docs/adr/0003-key-storage-strategy.md` antes de
-flashear cualquier build fuera de ese contexto.
+- `AGENTS.md` — documento operativo completo (alcance, modelo de amenaza,
+  reglas de C, estructura, proceso).
+- `docs/adr/` — 21 decisiones de arquitectura, cada decisión de protocolo,
+  memoria y manejo de claves respaldada.
+- `docs/format/` — convenciones de código, commits, análisis estático y
+  privacidad documental.
 
 ## Licencia
 

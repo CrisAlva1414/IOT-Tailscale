@@ -30,7 +30,7 @@ Corrida de confirmación fresca (todos en pass):
 - Tests unit host 7/7 bins PASS (h2 46/46).
 - cppcheck local con flags de `docs/format/static-analysis.md` → exit 0.
 - Build `-Werror` local esp32 y esp32c3 → OK.
-- Nodo `esp32-8219d4` (100.107.147.106) ONLINE en la tailnet al momento del check.
+- Nodo `esp32-<node-id>` (`<ip-tailnet>`) ONLINE en la tailnet al momento del check.
 - ADRs 0001-0021 presentes (incl. 0005 packaging/reuse y 0006 layering).
 
 Conclusión: la librería `components/tsnode` está validada para integrarse como

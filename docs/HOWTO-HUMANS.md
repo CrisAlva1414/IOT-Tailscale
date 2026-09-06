@@ -16,63 +16,10 @@ tsnode es un **cliente Tailscale mínimo en C puro** para ESP32. Conecta tu disp
 
 ## Inicio rápido
 
-### 1. Copiar el componente
-
-```bash
-cp -r components/tsnode /ruta/a/tu/proyecto/components/
-```
-
-### 2. Configurar sdkconfig
-
-Agrega al final de tu `sdkconfig.defaults`:
-
-```
-CONFIG_MBEDTLS_CHACHA20_C=y
-CONFIG_MBEDTLS_POLY1305_C=y
-CONFIG_MBEDTLS_CHACHAPOLY_C=y
-```
-
-### 3. Código mínimo
-
-```c
-#include <nvs_flash.h>
-#include "tsnode.h"
-
-void app_main(void)
-{
-    nvs_flash_init();
-    tsnode_init();
-
-    tsnode_start(&(tsnode_app_config_t){
-        .wifi_ssid   = "MiSSID",
-        .wifi_psk    = "MiPSK",
-        .ts_auth_key = "tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-    });
-
-    /* El device se conecta solo. El cliente corre en background. */
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
-}
-```
-
-### 4. Generar auth key
-
-1. Andá a https://login.tailscale.com/admin/settings/keys
-2. Click "Generate auth key"
-3. Configurá:
-   - **Reusable**: OFF (one-time use)
-   - **Expiry**: 7 días (o lo que necesites)
-   - **Tags**: `tag:esp32-iot`
-4. Copiá la key (empieza con `tskey-auth-`)
-
-### 5. Compilar y flashear
-
-```bash
-idf.py set-target esp32
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
-```
+Para empezar en 10 minutos, seguí **`docs/QUICKSTART.md`** (copiar el
+componente, flags de sdkconfig, código mínimo, auth key, flash). Este
+documento es la **guía extendida** del SDK: configuración, estados,
+seguridad, multi-target y debugging.
 
 ## Variables de configuración
 
