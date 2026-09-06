@@ -87,7 +87,7 @@ deltas/keepalives y debería figurar "active" en `tailscale status` (validar en 
 **Archivos clave**: `components/tsnode/src/proto/h2.{c,h}` (h2_ping_send, h2_post_keepalive), `components/tsnode/src/proto/tsnode_client.c` (do_map_poll + keepalive poll loop + keepalive WG), `tests/unit/test_h2.c`, `docs/adr/0020-h2-longpoll-ping-keepalive.md`, `docs/adr/0019-wg-session-keepalive-and-mbedtls-x25519-clamp.md`
 
 ### GOAL-8: Streaming de /machine/map + autostart (ADR-0021)
-**Estado**: COMPLETED ✅ (código + tests + build; validación en hardware pendiente)
+**Estado**: COMPLETED ✅ (validado en hardware 2026-09-06, con un bug real corregido)
 **Criterio de éxito**: El nodo mantiene un stream long-lived de `/machine/map` (deltas y
 keepalives), figura "active" en `tailscale status`, y arranca solo al boot con registro único
 (no re-registra en cada reboot).
@@ -99,9 +99,17 @@ para limpieza del data plane. `regdone` en NVS hace el registro una sola vez; au
 opcional en `tsnode_client_config_t` (tras el primer registro se borra de NVS).
 `main/autostart.{c,h}`: WiFi (30s) → cliente → ONLINE (90s) → wipe de auth key.
 Build IDF PASS (-Werror), cppcheck limpio, tests host 45/45 en test_h2.
-**Pendiente**: flashear y validar en hardware (estado "active" en consola, deltas aplicadas,
-`tsconnect` post-reboot sin auth key).
-**Archivos clave**: `components/tsnode/src/proto/h2.{c,h}`, `components/tsnode/src/proto/tsnode_map.{c,h}`, `components/tsnode/src/proto/tsnode_client.{c,h}`, `components/tsnode/src/wg/wg.{c,h}`, `components/tsnode/src/disco/disco.{c,h}`, `main/autostart.{c,h}`, `main/prov_store.{c,h}`, `main/main.c`, `main/console.c`, `tests/unit/test_h2.c`, `docs/adr/0021-map-streaming-and-autostart.md`, `docs/sessions/2026-09-06-map-streaming-autostart.md`
+**Fix de hardware (2026-09-06)**: con `Stream:true` el control plane moderno entrega el netmap
+INICIAL en chunks como deltas (`PeersChanged`), sin pasar por un `"Peers":[...]` full. El handler
+solo marcaba ONLINE con `is_full` → el cliente quedaba en MAP_SYNC, autostart logueaba
+"sin ONLINE en 90s" y la auth key nunca se purgaba (el data plane sí funcionaba). Fix: el primer
+mensaje con contenido de netmap (peers upsert o removidos) marca el netmap entregado y ONLINE.
+Validado en hardware: `state -> 5`, `ONLINE — auth key ... borrada`, nodo "active; direct" en
+`tailscale status`, `ping` 0% pérdida; netmap inicial `4 peers` vía deltas.
+**Pendiente**: nada bloqueante. Observación menor: `main/console.c status` muestra `tsnode:
+INITIALIZED` (estado app-level no refleja ONLINE del cliente) — cosmético local, no afecta la
+tailnet ni el autostart.
+**Archivos clave**: `components/tsnode/src/proto/h2.{c,h}`, `components/tsnode/src/proto/tsnode_map.{c,h}`, `components/tsnode/src/proto/tsnode_client.{c,h}`, `components/tsnode/src/wg/wg.{c,h}`, `components/tsnode/src/disco/disco.{c,h}`, `main/autostart.{c,h}`, `main/prov_store.{c,h}`, `main/main.c`, `main/console.c`, `tests/unit/test_h2.c`, `docs/adr/0021-map-streaming-and-autostart.md`, `docs/sessions/2026-09-06-map-streaming-autostart.md`, `docs/sessions/2026-09-06-goal8-hardware-chunked-netmap-online-fix.md`
 
 ### GOAL-7: Flash encryption en Release mode
 **Estado**: BUILD READY (config completa, build Release exitoso, pendiente flasheo en hardware)

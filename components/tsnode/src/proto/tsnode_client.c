@@ -155,7 +155,7 @@ static uint8_t s_reg_resp[REGISTER_RESPONSE_BUF_SIZE];
  * de la tarea del cliente — sin stack de por medio. */
 static tsnode_map_stream_t s_map_stream;
 static tsnode_map_netmap_t s_netmap;
-static bool s_stream_has_full = false;
+static bool s_stream_initialized = false;
 
 /* ---- Timestamp helper for packet logging ---- */
 static uint64_t s_start_ms = 0;
@@ -1123,8 +1123,9 @@ static tsnode_err_t drop_data_plane_peer(const uint8_t key[32])
 }
 
 /* Aplica UN mensaje de MapResponse (netmap, delta o keepalive) al netmap
- * vivo y al data plane (ADR-0021). El primer netmap full es el que lleva
- * al estado ONLINE (reemplaza al viejo map sync post-register). */
+ * vivo y al data plane (ADR-0021). El primer mensaje con contenido de
+ * netmap (full o deltas iniciales en chunks) es el que lleva al estado
+ * ONLINE (reemplaza al viejo map sync post-register). */
 static tsnode_err_t map_stream_handle_message(const uint8_t *json,
                                                size_t json_len)
 {
@@ -1142,8 +1143,8 @@ static tsnode_err_t map_stream_handle_message(const uint8_t *json,
     }
 
     if (is_full) {
-        if (!s_stream_has_full) {
-            s_stream_has_full = true;
+        if (!s_stream_initialized) {
+            s_stream_initialized = true;
             TSNODE_LOGI(TAG, "netmap (stream): %u peers, self=%s",
                         s_netmap.peer_count, s_netmap.self_ip);
             /* Solo acá (o en un resync posterior) se re-aplica el data
@@ -1155,6 +1156,18 @@ static tsnode_err_t map_stream_handle_message(const uint8_t *json,
                         s_netmap.peer_count);
             peers_updated = true;
         }
+    } else if (!s_stream_initialized && (peers_updated || n_removed > 0)) {
+        /* Inicial en chunks (hallazgo de hardware 2026-09-06): con
+         * Stream:true el control plane moderno entrega el netmap inicial
+         * como deltas (PeersChanged), sin el "Peers":[...] full del modo
+         * poll. El primer mensaje que ya tocó el netmap (peers agregados
+         * o removidos) marca el netmap entregado y ONLINE — lo mismo que
+         * el netmap full del modo Stream:false. Sin esto el cliente
+         * quedaba en MAP_SYNC y el autostart nunca limpiaba la auth key. */
+        s_stream_initialized = true;
+        TSNODE_LOGI(TAG, "netmap (stream, deltas): %u peers, self=%s",
+                    s_netmap.peer_count, s_netmap.self_ip);
+        set_state(TSNODE_CLIENT_ONLINE);
     }
 
     if (peers_updated) {
@@ -1244,9 +1257,9 @@ static tsnode_err_t do_map_stream(void)
     snprintf(lb_value, sizeof(lb_value), "nodekey:%s", s_node_key_pub_hex);
 
     /* Stream nuevo: splitter y netmap parten limpios. En el primer mensaje
-     * (full) el handler marca ONLINE. */
+     * (full o deltas iniciales) el handler marca ONLINE. */
     tsnode_map_stream_init(&s_map_stream);
-    s_stream_has_full = false;
+    s_stream_initialized = false;
 
     /* Recv timeout corto durante el stream: cada timeout dispara un PING
      * fire-and-forget (ADR-0020) que mantiene NAT/firewall sin morirse. */

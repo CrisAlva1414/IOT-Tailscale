@@ -1430,6 +1430,47 @@ static void test_map_apply_full_replaces(void)
     CHECK(memcmp(netmap.peers[0].key, expect_c, 32) == 0);
 }
 
+static void test_map_apply_chunked_initial_only(void)
+{
+    /* Regression HW 2026-09-06: con Stream:true el control plane moderno
+     * entrega el netmap INICIAL como deltas (PeersChanged) sin pasar por
+     * un "Peers":[...] full (modo chunks). El cliente debe tratar ese
+     * primer delta como el netmap entregado y llegar a ONLINE (fix en
+     * tsnode_client.c, DO-2026-09-06); acá se fija el contrato del parser:
+     * sobre un netmap vacío, un PeersChanged chunk reporta
+     * is_full=false + peers_updated=true + peers aplicados. */
+    tsnode_map_netmap_t netmap;
+    memset(&netmap, 0, sizeof(netmap));
+    bool is_full = false, updated = false;
+    uint8_t removed[TSNODE_MAP_MAX_REMOVED][32];
+    int n_removed = 0;
+
+    const char *chunk1 =
+        "{\"PeersChanged\":[{\"Key\":\"nodekey:" KEY_A
+        "\",\"AllowedIPs\":[\"100.64.0.20/32\"],"
+        "\"Endpoints\":[\"203.0.113.21:51820\"]}]}";
+    CHECK(tsnode_map_apply_response(&netmap, chunk1, strlen(chunk1),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(updated);
+    CHECK(netmap.peer_count == 1);
+    CHECK(strcmp(netmap.peers[0].tailscale_ip, "100.64.0.20") == 0);
+
+    const char *chunk2 =
+        "{\"PeersChanged\":[{\"Key\":\"nodekey:" KEY_B
+        "\",\"AllowedIPs\":[\"100.64.0.21/32\"],"
+        "\"Endpoints\":[\"203.0.113.22:51820\"]}]}";
+    is_full = updated = false;
+    CHECK(tsnode_map_apply_response(&netmap, chunk2, strlen(chunk2),
+                                    &is_full, &updated, removed, &n_removed) ==
+          TSNODE_OK);
+    CHECK(!is_full);
+    CHECK(updated);
+    CHECK(netmap.peer_count == 2);
+    CHECK(strcmp(netmap.peers[1].tailscale_ip, "100.64.0.21") == 0);
+}
+
 static void test_map_apply_peers_changed_upsert(void)
 {
     tsnode_map_netmap_t netmap;
@@ -1641,6 +1682,7 @@ int main(void)
     RUN(test_map_stream_accumulator_overflow_fails);
     RUN(test_map_stream_zstd_detected);
     RUN(test_map_apply_full_replaces);
+    RUN(test_map_apply_chunked_initial_only);
     RUN(test_map_apply_peers_changed_upsert);
     RUN(test_map_apply_peers_changed_update);
     RUN(test_map_apply_peers_removed);
