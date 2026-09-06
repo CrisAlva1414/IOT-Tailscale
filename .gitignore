@@ -32,6 +32,7 @@ tests/unit/test_wg
 tests/unit/test_replay
 tests/unit/test_nacl_box
 tests/unit/test_icmp_echo
+tests/unit/test_disco
 tests/interop/wg_interop
 
 # Sistema

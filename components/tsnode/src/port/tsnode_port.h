@@ -68,18 +68,23 @@ typedef void (*tsnode_port_log_fn)(int level, const char *tag, const char *fmt,
 void tsnode_port_set_log(tsnode_port_log_fn fn);
 tsnode_port_log_fn tsnode_port_get_log(void);
 
-/* Convenience macros que delegan al callback registrado */
-#define TSNODE_LOGE(tag, fmt, ...) do { \
+/* Convenience macros que delegan al callback registrado.
+ *
+ * ISO C variadic macros: `(tag, ...)` y `__VA_ARGS__` sin `##` (GNU).
+ * El formato y sus argumentos entran todos en `__VA_ARGS__` (siempre >= 1),
+ * así que esto es C99 estricto y el core compila en tests host con
+ * -Wpedantic -Werror (docs/format/c-style.md). */
+#define TSNODE_LOGE(tag, ...) do { \
     tsnode_port_log_fn _fn = tsnode_port_get_log(); \
-    if (_fn) _fn(0, tag, fmt, ##__VA_ARGS__); \
+    if (_fn) _fn(0, tag, __VA_ARGS__); \
 } while (0)
-#define TSNODE_LOGW(tag, fmt, ...) do { \
+#define TSNODE_LOGW(tag, ...) do { \
     tsnode_port_log_fn _fn = tsnode_port_get_log(); \
-    if (_fn) _fn(1, tag, fmt, ##__VA_ARGS__); \
+    if (_fn) _fn(1, tag, __VA_ARGS__); \
 } while (0)
-#define TSNODE_LOGI(tag, fmt, ...) do { \
+#define TSNODE_LOGI(tag, ...) do { \
     tsnode_port_log_fn _fn = tsnode_port_get_log(); \
-    if (_fn) _fn(2, tag, fmt, ##__VA_ARGS__); \
+    if (_fn) _fn(2, tag, __VA_ARGS__); \
 } while (0)
 
 /* --- Red: sockets TCP/TLS para ts2021 (ADR-0008) --- */

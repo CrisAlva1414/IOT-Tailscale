@@ -31,8 +31,11 @@ static const char *TS_ID_KEY_DISCO_PRIV = "discprv";
 
 /* ---- Internal helpers ---- */
 
-/* Constant-time comparison (AGENTS.md section 4: never use memcmp for secrets) */
-static bool ct_memcmp(const void *a, const void *b, size_t len)
+/* Constant-time comparison (AGENTS.md section 4: never use memcmp for secrets).
+ * Retorna TRUE si los buffers son iguales (nombre explícito: ct_equal, no
+ * ct_memcmp — memcmp retorna 0 en la igualdad, esto retorna 1). Los call
+ * sites usan `if (ct_equal(...))` como condición de igualdad. */
+static bool ct_equal(const void *a, const void *b, size_t len)
 {
     const volatile uint8_t *x = a;
     const volatile uint8_t *y = b;
@@ -212,7 +215,7 @@ static tsnode_disco_peer_t *find_peer_by_disco_key(tsnode_disco_state_t *st,
                                                     const uint8_t disco_pub[32])
 {
     for (int i = 0; i < st->n_peers; i++) {
-        if (ct_memcmp(st->peers[i].disco_pubkey, disco_pub, 32) == 0) {
+        if (ct_equal(st->peers[i].disco_pubkey, disco_pub, 32)) {
             return &st->peers[i];
         }
     }
@@ -352,12 +355,18 @@ tsnode_err_t tsnode_disco_handle_packet(tsnode_disco_state_t *st,
     case TSNODE_DISCO_PONG: {
         uint8_t txid[TSNODE_DISCO_TXID_LEN];
         memcpy(txid, plain + 2, TSNODE_DISCO_TXID_LEN);
-        if (ct_memcmp(txid, peer->pending_txid, TSNODE_DISCO_TXID_LEN) == 0) {
+        if (ct_equal(txid, peer->pending_txid, TSNODE_DISCO_TXID_LEN)) {
             peer->direct_path_ok = true;
             peer->retry_count = 0;
+            /* Guardar la ruta directa REAL (IP:port del que respondió el
+             * PONG, normalmente el LAN del peer). El data plane WG usa esto
+             * para el handshake, no el endpoints[0] público del MapResponse. */
+            peer->direct_ip = src_ip;
+            peer->direct_port = src_port;
             uint64_t now_ms;
             tsnode_port_uptime_ms(&now_ms);
             peer->last_pong_ms = now_ms;
+            log_ip_port("disco RX PONG - direct path ", src_ip, src_port);
             TSNODE_LOGI(TAG, "disco RX PONG - direct path confirmed");
         } else {
             TSNODE_LOGW(TAG, "disco PONG unexpected txid");
@@ -597,17 +606,46 @@ bool tsnode_disco_get_peer_endpoint(const tsnode_disco_state_t *st,
                                     int peer_idx,
                                     uint32_t *ip_out, uint16_t *port_out)
 {
-    if (st == NULL || peer_idx < 0 || peer_idx >= st->n_peers) {
+    if (st == NULL || peer_idx < 0 || peer_idx >= st->n_peers ||
+        ip_out == NULL || port_out == NULL) {
         return false;
     }
 
     const tsnode_disco_peer_t *peer = &st->peers[peer_idx];
 
-    if (!peer->direct_path_ok || peer->n_endpoints == 0) {
+    if (!peer->direct_path_ok) {
         return false;
     }
 
-    *ip_out = peer->endpoints[0].ip;
-    *port_out = peer->endpoints[0].port;
-    return true;
+    /* Devolver la ruta directa REAL confirmada por PONG (ej. LAN del peer);
+     * no endpoints[0] que es el público del MapResponse. */
+    if (peer->direct_ip != 0 && peer->direct_port != 0) {
+        *ip_out = peer->direct_ip;
+        *port_out = peer->direct_port;
+        return true;
+    }
+
+    /* Fallback defensivo: si no hay ruta directa guardada pero direct_path_ok
+     * quedó seteado, usar el primer endpoint. */
+    if (peer->n_endpoints > 0) {
+        *ip_out = peer->endpoints[0].ip;
+        *port_out = peer->endpoints[0].port;
+        return true;
+    }
+
+    return false;
+}
+
+int tsnode_disco_find_peer_by_wg_key(const tsnode_disco_state_t *st,
+                                     const uint8_t wg_pubkey[32])
+{
+    if (st == NULL || wg_pubkey == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < st->n_peers; i++) {
+        if (memcmp(st->peers[i].wg_pubkey, wg_pubkey, 32) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }

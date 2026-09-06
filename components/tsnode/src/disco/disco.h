@@ -33,7 +33,7 @@ extern "C" {
 #define TSNODE_DISCO_KEY_LEN       32u
 #define TSNODE_DISCO_NONCE_LEN     24u
 #define TSNODE_DISCO_TXID_LEN      12u
-#define TSNODE_DISCO_PING_MIN_LEN  44u   /* type(1)+ver(1)+txid(12)+nodekey(32) */
+#define TSNODE_DISCO_PING_MIN_LEN  46u   /* type(1)+ver(1)+txid(12)+nodekey(32) = 46 */
 #define TSNODE_DISCO_PONG_LEN      32u   /* type(1)+ver(1)+txid(12)+ip16(16)+port(2) */
 #define TSNODE_DISCO_MACBYTES      16u   /* Poly1305 tag */
 #define TSNODE_DISCO_MAX_PKT       256u
@@ -69,6 +69,12 @@ typedef struct {
     int n_endpoints;
     uint64_t last_pong_ms;
     bool direct_path_ok;
+    /* Endpoint (IP:port) desde el que este peer respondió PONG. Esta es la
+     * ruta directa REAL confirmada (p.ej. el LAN del peer), que suele diferir
+     * de endpoints[0] (el público del MapResponse). El data plane WG debe
+     * usar esta para el handshake. */
+    uint32_t direct_ip;
+    uint16_t direct_port;
     uint8_t pending_txid[TSNODE_DISCO_TXID_LEN];
     int retry_count;
 } tsnode_disco_peer_t;
@@ -129,6 +135,13 @@ tsnode_err_t tsnode_disco_add_peer(tsnode_disco_state_t *st,
                                    const uint32_t *endpoint_ips,
                                    const uint16_t *endpoint_ports,
                                    int n_eps);
+
+/*
+ * Find a peer by its WireGuard public key.
+ * Returns the peer index, or -1 if not found / invalid args.
+ */
+int tsnode_disco_find_peer_by_wg_key(const tsnode_disco_state_t *st,
+                                     const uint8_t wg_pubkey[32]);
 
 /* ---- Packet handling ---- */
 

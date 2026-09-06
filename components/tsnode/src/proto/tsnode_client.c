@@ -961,30 +961,55 @@ static tsnode_err_t update_wg_peers(const tsnode_map_netmap_t *netmap)
             }
             TSNODE_LOGI(TAG, "WG TX initiation ready %d bytes t=%lu ms", TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
 
-            /* Use first endpoint for WG initiation sendto */
+            /* Endpoint para el handshake WG: preferir la ruta directa REAL
+             * confirmada por disco (PONG, normalmente el LAN del peer) sobre
+             * el primer endpoint del MapResponse (público, que cae en
+             * hairpin-NAT sin ruta). Si disco aún no confirmó ruta directa,
+             * fallback al primer endpoint parseado. */
             uint32_t ep_ip = 0;
-            {
+            uint16_t ep_port = 0;
+            const char *ep_dst = mp->endpoints[0].ip;
+            bool use_direct = false;
+
+            if (s_disco_initialized) {
+                int dp_idx = tsnode_disco_find_peer_by_wg_key(&s_disco, mp->key);
+                if (dp_idx >= 0) {
+                    uint32_t d_ip = 0;
+                    uint16_t d_port = 0;
+                    if (tsnode_disco_get_peer_endpoint(&s_disco, dp_idx,
+                                                       &d_ip, &d_port)) {
+                        ep_ip = d_ip;
+                        ep_port = d_port;
+                        use_direct = true;
+                    }
+                }
+            }
+
+            if (!use_direct) {
                 unsigned a, b, c, d;
                 if (sscanf(mp->endpoints[0].ip, "%u.%u.%u.%u",
                            &a, &b, &c, &d) == 4) {
                     ep_ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
                             ((uint32_t)c << 8) | (uint32_t)d;
                 }
+                ep_port = mp->endpoints[0].port;
             }
 
             err = tsnode_port_udp_sendto(s_wg_sock, initiation,
                                           sizeof(initiation),
-                                          ep_ip, mp->endpoints[0].port);
+                                          ep_ip, ep_port);
             if (err != TSNODE_OK) {
                 TSNODE_LOGW(TAG, "WG TX initiation FAILED: %d peer=%d dst=%s:%u t=%lu ms",
-                            err, idx, mp->endpoints[0].ip, mp->endpoints[0].port,
+                            err, idx, ep_dst, ep_port,
                             (unsigned long)ts_rel_ms());
             } else {
                 s_wg_counters.tx_initiation++;
-                TSNODE_LOGI(TAG, "WG TX init #%lu -> %s:%u len=%d t=%lu ms",
+                TSNODE_LOGI(TAG, "WG TX init #%lu -> %u.%u.%u.%u:%u len=%d t=%lu ms%s",
                             (unsigned long)s_wg_counters.tx_initiation,
-                            mp->endpoints[0].ip, mp->endpoints[0].port,
-                            TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms());
+                            (ep_ip >> 24) & 0xFF, (ep_ip >> 16) & 0xFF,
+                            (ep_ip >> 8) & 0xFF, ep_ip & 0xFF, ep_port,
+                            TSNODE_WG_INITIATION_LEN, (unsigned long)ts_rel_ms(),
+                            use_direct ? " (disco direct)" : "");
             }
         }
     }

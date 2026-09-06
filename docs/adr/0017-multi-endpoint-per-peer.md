@@ -51,6 +51,10 @@ botella era el struct del mapa (1 solo endpoint) y el cableado en
     conectividad directa).
   - Para el handshake WG de arranque usa `endpoints[0]` (primer endpoint del
     MapResponse, que en Tailscale es típicamente el LAN-privado cuando existe).
+- **Ampliación 2026-09-05 (ADR-0018)**: la elección del endpoint para el
+  handshake WG de arranque deja de ser fija en `endpoints[0]`: si disco ya
+  confirmó una ruta directa (PONG válido de una IP:port), esa ruta tiene
+  prioridad. ADR-0018 documenta la decisión y su modelo de confianza.
 - Esta decisión **no** agrega reintento/balancing heurístico de endpoints en el
   handshake WG síncrono de arranque: el multi-endpoint efectivo lo hace la capa
   de disco (probe) por debajo, mientras que el arranque usa el que más
