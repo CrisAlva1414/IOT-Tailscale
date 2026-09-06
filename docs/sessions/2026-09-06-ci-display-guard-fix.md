@@ -23,6 +23,20 @@ notificaciones de build roto. Se pidió detectar el arch-guard crítico y correg
 Ninguna nueva. Se reafirmó el arch-guard (ADR-0006: core de plataforma pura) que ya
 pasa en CI y localmente (0 includes de `esp_|freertos|nvs|driver|lwip` en tsnode).
 
+## Verificación previa a integración
+Corrida de confirmación fresca (todos en pass):
+- `git status` limpio salvo `.opencode/` y `opencode.json` (config local, sin commit); 0 commits sin pushear.
+- CI: `cppcheck`, `build (esp32|esp32c3|esp32s3|esp32c6)` → success (run `34045434520`).
+- Tests unit host 7/7 bins PASS (h2 46/46).
+- cppcheck local con flags de `docs/format/static-analysis.md` → exit 0.
+- Build `-Werror` local esp32 y esp32c3 → OK.
+- Nodo `esp32-8219d4` (100.107.147.106) ONLINE en la tailnet al momento del check.
+- ADRs 0001-0021 presentes (incl. 0005 packaging/reuse y 0006 layering).
+
+Conclusión: la librería `components/tsnode` está validada para integrarse como
+componente. Falta deliberadamente el gate de hardening de despliegue (GOAL-7:
+flash encryption Release + decisión de eFuse) antes de marcar nada "producción".
+
 ## Pendiente / bloqueado
 - la integración de `tsnode` como librería en el dispositivo del usuario sigue
   documentada en `docs/QUICKSTART.md` (opción v1: copiar `components/tsnode`).
