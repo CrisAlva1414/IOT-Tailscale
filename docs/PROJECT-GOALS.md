@@ -33,12 +33,15 @@ contra disco_test.go de Tailscale). El código que escribía `pong_plain[31]` ya
 **Archivos clave**: `components/tsnode/src/disco/disco.h`
 
 ### GOAL-3: Endpoint reporting con IP pública
-**Estado**: COMPLETED (endpoint STUN wired into MapRequest; pendiente validación en hardware)
+**Estado**: COMPLETED ✅ (validado en hardware 2026-09-06)
 **Criterio de éxito**: MapRequest incluye endpoint público (STUN-descubierto), no IP local WiFi (192.168.x.x).
 **Estado técnico**: Nuevo getter `tsnode_disco_get_stun_endpoint()` en disco; `apply_stun_endpoint_to_config()`
 en `tsnode_client.c` reemplaza la IP local por la pública STUN al inicio de cada `do_map_poll()`. Build PASS,
-tests unitarios PASS, cppcheck limpio. Pendiente: verificar en hardware que el 2do poll (30s) reporta la IP
-pública en MapRequest.
+tests unitarios PASS, cppcheck limpio.
+**Evidencia de hardware (2026-09-06, corrida larga GOAL-6)**: el log serial muestra
+`poll: stun=199.38.181.93:3478 n_peers=4` en **ambos** MapRequest del poll loop (2/2), con
+`STUN TX -> 199.38.181.93:3478` antes de cada uno. El endpoint STUN público se reporta en
+el 1er y 2do poll — no la IP LAN WiFi.
 **Archivos clave**: `components/tsnode/src/proto/tsnode_client.c`, `components/tsnode/src/disco/disco.{c,h}`
 
 ### GOAL-4: Logging perfecto
@@ -52,24 +55,36 @@ no-imprimibles. Build PASS, tests PASS, cppcheck limpio.
 ### GOAL-5: Ping end-to-end
 **Estado**: COMPLETED ✅ — validado en hardware real (2026-09-05)
 **Criterio de éxito**: Desde la tailnet, hacer `ping 100.x.x.x` y recibir respuesta.
-**Evidencia de hardware**: `tailscale ping --verbose 100.107.147.106` → `pong from esp32-8219d4 via 192.168.1.104:51820`; kernel `ping` con replies (RTT ~10ms en régimen); `tailscale status` → `active; direct 192.168.1.104:51820`. Serial ESP32: `WG RX init #1` → `WG response sent` → `WG ICMP echo reply #N` (ambos roles: nuestro init y el rekey del notebook). Sesión WG activada por keepalive (ADR-0019): transport data vacío tras `ESTABLISHED` y cada 10s de idle, lo que destrabó el flujo de datos (antes sesiones mudas).
+**Evidencia de hardware**: `tailscale ping --verbose <ip-tailnet>` → `pong from <hostname> via <ip-lan>:51820`; kernel `ping` con replies (RTT ~10ms en régimen); `tailscale status` → `active; direct <ip-lan>:51820`. Serial ESP32: `WG RX init #1` → `WG response sent` → `WG ICMP echo reply #N` (ambos roles: nuestro init y el rekey del notebook). Sesión WG activada por keepalive (ADR-0019): transport data vacío tras `ESTABLISHED` y cada 10s de idle, lo que destrabó el flujo de datos (antes sesiones mudas).
 **Estado técnico**: `wg/icmp_echo.{c,h}` transforma echo request→reply in-place (ADR-0016). `tsnode_client.c` re-encapsula el reply por el túnel. Fijados además: `create_response` con `keygen()` clampeado (mbedTLS rechaza escalares con bit 255 → `-0x4c80` intermitente) y clamp completo RFC 7748 en el wrapper X25519 (ADR-0019). El handshake prefiere la ruta directa confirmada por disco (ADR-0018).
 **Archivos clave**: `components/tsnode/src/wg/icmp_echo.{c,h}`, `components/tsnode/src/proto/tsnode_client.c`, `components/tsnode/src/wg/wg.c`, `components/tsnode/src/port/esp_idf/x25519_wrapper.c`, `docs/adr/0016-icmp-echo-responder.md`, `docs/adr/0019-wg-session-keepalive-and-mbedtls-x25519-clamp.md`
 
 ### GOAL-6: Conexión estable (99.9% uptime)
-**Estado**: PARTIAL (keepalive H2 PING + keepalive WG de sesión implementados; pendiente corrida larga en hardware)
+**Estado**: COMPLETED ✅ — validado en hardware real (2026-09-06, corrida de 85 min)
 **Criterio de éxito**: El dispositivo permanece conectado mientras esté encendido (USB). Reconnect < 10s.
-**Problema actual**: Ciclaba cada ~90s (90s on / 5s reconnect). Causal hipotetizada: NAT/firewall
-derriba la conexión del control plane tras ~90s de idle entre polls de map.
-**Estado técnico**: Añadido `h2_ping()` (ADR-0009 D1: PING sobre túnel H2/Noise) y un keepalive en el
-poll loop de `tsnode_client.c` que envía un PING HTTP/2 cada `H2_PING_IDLE_S=20s` de idle para refrescar
-el mapping NAT. Un keepalive fallido entra en el backoff de reconexión existente. Tests host
-(test_h2.c, 4 casos nuevos), build PASS (-Werror), cppcheck limpio (solo finding pre-existente no
-relacionado). Además, desde 2026-09-05 el plano de datos tiene keepalive WG de sesión (ADR-0019, GOAL-5):
-transport data cada 10s de idle por peer — las sesiones ya no quedan mudas y el peer se ve `active` en
-magicsock/wg (aunque la consola Tailscale siga mostrando "offline" por heartbeat del control plane,
-cosmético). Pendiente: validar nodo online > 1h sin ciclo de 90s (corrida larga con ambos keepalives).
-**Archivos clave**: `components/tsnode/src/proto/h2.{c,h}` (h2_ping), `components/tsnode/src/proto/tsnode_client.c` (keepalive poll loop + keepalive WG), `tests/unit/test_h2.c`, `docs/adr/0019-wg-session-keepalive-and-mbedtls-x25519-clamp.md`
+**Evidencia de hardware (2026-09-06)**: corrida continua de **85 minutos** (una sola conexión:
+1 handshake Noise, 1 transición `state -> 5` online) con **0 disconnects, 0 reconnects, 0 errores
+de red** durante todo el período; el firmware anterior ciclaba cada ~90-300s
+(timeout→re-POST→NETWORK→reconnect). El long-poll de `/machine/map` generó **444 timeouts de idle
+de la capa de registros, todos absorbidos** por el keepalive inline de ADR-0020 (un PING HTTP/2
+por cada silencio de 10s) con **443 registros de 17 bytes** (frames PING/ACK h2) recibidos del
+control plane; el mapping NAT nunca venció. Plano de datos verificado durante la corrida con
+`tailscale ping -> pong directo vía <ip-lan>:51820` en los hitos de 15, 30 y 60 min
+(1326 WG keepalives de sesión emitidos, 86 disco PING / 12 PONG). Reconnect: 0 ocurrencias en la
+corrida (el camino de reconexión usa backoff base de 5s, dentro del `reconnect < 10s`).
+**Estado técnico**: Causa raíz del ciclo era el long-poll bloqueante de `/machine/map`: el cliente
+quedaba hasta 300s con **cero tráfico saliente** y el binding NAT/firewall moría (~90s de idle) sin
+detectarse hasta el timeout. Fix (ADR-0020): `h2_ping_send()` + `h2_post_keepalive()` — durante el
+long-poll, cada timeout de la capa de registros (recv timeout reducido de 300s a `H2_LONGPOLL_PING_S=10s`)
+dispara un PING fire-and-forget y se sigue esperando; contador de silencio
+(`H2_LONGPOLL_MAX_SILENT_PINGS=10`) aborta con NETWORK si el par no responde NINGÚN frame (detección
+fail-closed de half-open ≤100s). Tests host: 3 casos nuevos (keepalive sobrevive timeouts,
+límite de silencio fail-closed, `h2_post` histórico sigue fail-closed), 31/31 PASS; build PASS
+(-Werror); cppcheck limpio. Nota conocida y aceptada (cosmética): la consola Tailscale muestra el
+nodo como "offline / last seen" porque el MapRequest usa `Stream:false` (respuestas de netmap
+completo, no deltas) — el plano de datos y el registro/poll del control plane funcionan (el nodo
+recibe MapResponses válidas con su propio netmap).
+**Archivos clave**: `components/tsnode/src/proto/h2.{c,h}` (h2_ping_send, h2_post_keepalive), `components/tsnode/src/proto/tsnode_client.c` (do_map_poll + keepalive poll loop + keepalive WG), `tests/unit/test_h2.c`, `docs/adr/0020-h2-longpoll-ping-keepalive.md`, `docs/adr/0019-wg-session-keepalive-and-mbedtls-x25519-clamp.md`
 
 ### GOAL-7: Flash encryption en Release mode
 **Estado**: BUILD READY (config completa, build Release exitoso, pendiente flasheo en hardware)

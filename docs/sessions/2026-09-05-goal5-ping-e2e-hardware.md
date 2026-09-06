@@ -6,7 +6,7 @@ GOAL-5 pedía `ping 100.x.x.x` desde la tailnet con respuesta del ESP32.
 El data plane WireGuard ya establecía sesiones pero no fluía tráfico real
 (sesiones "ESTABLISHED" mudas) y el path de responder fallaba
 intermitentemente. Esta sesión cerró ambos bugs y validó el ping
-end-to-end en hardware real (notebook → esp32-8219d4).
+end-to-end en hardware real (notebook → `<hostname>`).
 
 ## Cambios
 
@@ -40,15 +40,15 @@ end-to-end en hardware real (notebook → esp32-8219d4).
 ## Validación en hardware (resumen de evidencia serial del ESP32)
 
 - Sesión vía nuestro init + respuesta del notebook:
-  `WG RX resp #1 from 192.168.1.100:41641 len=92` → `ESTABLISHED peer=0`
+  `WG RX resp #1 from <ip-lan>:41641 len=92` → `ESTABLISHED peer=0`
   → keepalive inmediato → `WG ICMP echo reply #1..#3` (pings reales).
 - Path de responder (rekey natural del notebook, ~120 s):
-  `WG RX init #1 from 192.168.1.100:41641 len=148` →
+  `WG RX init #1 from <ip-lan>:41641 len=148` →
   `WG response sent` (sin `-0x4c80`) → pong en `tailscale ping`
   (1.581 s primer paquete) → RTT kernel `ping` ~10 ms en régimen.
 - Keepalives bidireccionales: `WG RX keepalive #2 peer=0` del notebook y
   `WG TX keepalive #N peer=0` nuestros cada 10 s.
-- `tailscale status`: `esp32-8219d4 ... active; direct 192.168.1.104:51820`
+- `tailscale status`: `<hostname> ... active; direct <ip-lan>:51820`
   (el `offline, last seen 1h` es el heartbeat del control plane, cosmético).
 
 ## Pendiente / bloqueado

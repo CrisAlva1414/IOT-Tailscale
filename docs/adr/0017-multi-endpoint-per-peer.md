@@ -35,8 +35,8 @@ botella era el struct del mapa (1 solo endpoint) y el cableado en
 - `peer->online = (peer->n_endpoints > 0)`.
 - **Ampliación 2026-09-03 (hardware)**: el cap subió de 4 a 16. Los peers de la
   tailnet real (notebook, OrangePi, PC) exponen entre 10 y 17 endpoints: la IP
-  pública + múltiples puentes Docker `172.x.y.1` + `192.168.122.1` (libvirt) +
-  el endpoint LAN-privado al final de la lista (p.ej. `192.168.1.100` en índice
+  pública + múltiples puentes Docker `172.x.y.1` + `<ip-lan>` (libvirt) +
+  el endpoint LAN-privado al final de la lista (p.ej. `<ip-lan>` en índice
   8-15). Con cap=4 el LAN se perdía y disco nunca lo probaba. `disco.h`
   `TSNODE_DISCO_MAX_ENDPOINTS` también sube a 16 para que disco pruebe todos los
   candidatos que el parser conserva.
